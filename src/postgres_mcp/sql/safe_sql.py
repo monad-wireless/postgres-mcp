@@ -220,6 +220,9 @@ class SafeSqlDriver(SqlDriver):
         "trim_array",
         "unnest",
         "any",
+        # Set-returning series generators (pure; reachable only from FROM once FROM is validated)
+        "generate_series",
+        "generate_subscripts",
         # String functions
         "ascii",
         "bit_length",
@@ -865,15 +868,18 @@ class SafeSqlDriver(SqlDriver):
         "postgis_topology",
     }
 
-    def __init__(self, sql_driver: SqlDriver, timeout: float | None = None):
+    def __init__(self, sql_driver: SqlDriver, timeout: float | None = None, extra_functions: frozenset[str] = frozenset()):
         """Initialize with an underlying SQL driver and optional timeout.
 
         Args:
             sql_driver: The underlying SQL driver to wrap
             timeout: Optional timeout in seconds for query execution
+            extra_functions: Additional lower-case function names to accept, discovered from installed
+                extensions by ``extension_functions.discover_read_only_functions`` (opt-in)
         """
         self.sql_driver = sql_driver
         self.timeout = timeout
+        self.extra_functions = extra_functions
 
     def _validate_node(self, node: Node) -> None:
         """Recursively validate a node and all its children"""
@@ -899,7 +905,7 @@ class SafeSqlDriver(SqlDriver):
             # Strip pg_catalog schema if present
             match = self.PG_CATALOG_PATTERN.match(func_name)
             unqualified_name = match.group(1) if match else func_name
-            if unqualified_name not in self.ALLOWED_FUNCTIONS:
+            if unqualified_name not in self.ALLOWED_FUNCTIONS and unqualified_name not in self.extra_functions:
                 raise ValueError(f"Function {func_name} is not allowed")
 
         # Reject SELECT statements with locking clauses
@@ -929,21 +935,20 @@ class SafeSqlDriver(SqlDriver):
                 # Skip attributes that don't exist (this is normal in pglast)
                 continue
 
-            # Handle lists of nodes
-            if isinstance(attr, list):
-                for item in attr:
-                    if isinstance(item, Node):
-                        self._validate_node(item)
+            self._validate_children(attr)
 
-            # Handle tuples of nodes
-            elif isinstance(attr, tuple):
-                for item in attr:
-                    if isinstance(item, Node):
-                        self._validate_node(item)
+    def _validate_children(self, attr: Any) -> None:
+        """Validate a node attribute, descending through nested lists and tuples.
 
-            # Handle single nodes
-            elif isinstance(attr, Node):
-                self._validate_node(attr)
+        pglast nests some children more than one level deep: ``RangeFunction.functions`` is a
+        tuple of ``(FuncCall, coldeflist)`` tuples. Walking only one level skipped every function
+        called in a FROM clause, so ``SELECT * FROM pg_read_file(...)`` was never checked.
+        """
+        if isinstance(attr, Node):
+            self._validate_node(attr)
+        elif isinstance(attr, (list, tuple)):
+            for item in attr:
+                self._validate_children(item)
 
     def _validate(self, query: str) -> None:
         """Validate query is safe to execute"""

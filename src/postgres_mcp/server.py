@@ -31,7 +31,9 @@ from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
+from .sql import discover_read_only_functions
 from .sql import obfuscate_password
+from .sql import parse_extension_list
 from .top_queries import TopQueriesCalc
 
 # Initialize FastMCP with default settings
@@ -56,6 +58,8 @@ class AccessMode(str, Enum):
 # Global variables
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
+# Read-only extension functions accepted in RESTRICTED mode (--allow-extension-functions), discovered at startup.
+extension_functions: frozenset[str] = frozenset()
 shutdown_in_progress = False
 
 
@@ -65,7 +69,7 @@ async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
 
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug("Using SafeSqlDriver with restrictions (RESTRICTED mode)")
-        return SafeSqlDriver(sql_driver=base_driver, timeout=30)  # 30 second timeout
+        return SafeSqlDriver(sql_driver=base_driver, timeout=30, extra_functions=extension_functions)  # 30 second timeout
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
@@ -566,6 +570,15 @@ async def main():
         help="Set SQL access mode: unrestricted (unrestricted) or restricted (read-only with protections)",
     )
     parser.add_argument(
+        "--allow-extension-functions",
+        type=str,
+        default="",
+        help=(
+            "Restricted mode only: comma-separated extensions (e.g. postgis,mobilitydb) whose IMMUTABLE/STABLE, "
+            "non-SECURITY-DEFINER functions the query validator accepts. The transaction stays read-only."
+        ),
+    )
+    parser.add_argument(
         "--transport",
         type=str,
         choices=["stdio", "sse", "streamable-http"],
@@ -600,8 +613,11 @@ async def main():
     args = parser.parse_args()
 
     # Store the access mode in the global variable
-    global current_access_mode
+    global current_access_mode, extension_functions
     current_access_mode = AccessMode(args.access_mode)
+    allowed_extensions = parse_extension_list(args.allow_extension_functions)
+    if allowed_extensions and current_access_mode != AccessMode.RESTRICTED:
+        logger.warning("--allow-extension-functions has no effect outside restricted mode")
 
     # Add the query tool with a description and annotations appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
@@ -637,6 +653,8 @@ async def main():
     try:
         await db_connection.pool_connect(database_url)
         logger.info("Successfully connected to database and initialized connection pool")
+        if allowed_extensions and current_access_mode == AccessMode.RESTRICTED:
+            extension_functions = await discover_read_only_functions(SqlDriver(conn=db_connection), allowed_extensions)
     except Exception as e:
         logger.warning(
             f"Could not connect to database: {obfuscate_password(str(e))}",

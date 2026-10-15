@@ -3,6 +3,8 @@
 from .bind_params import ColumnCollector
 from .bind_params import SqlBindParams
 from .bind_params import TableAliasVisitor
+from .extension_functions import discover_read_only_functions
+from .extension_functions import parse_extension_list
 from .extension_utils import check_extension
 from .extension_utils import check_hypopg_installation_status
 from .extension_utils import check_postgres_version_requirement
@@ -25,7 +27,9 @@ __all__ = [
     "check_extension",
     "check_hypopg_installation_status",
     "check_postgres_version_requirement",
+    "discover_read_only_functions",
     "get_postgres_version",
     "obfuscate_password",
+    "parse_extension_list",
     "reset_postgres_version_cache",
 ]
