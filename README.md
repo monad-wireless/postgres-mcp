@@ -226,6 +226,25 @@ Postgres MCP Pro supports multiple *access modes* to give you control over the o
 
 To use restricted mode, replace `--access-mode=unrestricted` with `--access-mode=restricted` in the configuration examples above.
 
+##### Extension functions in restricted mode (optional)
+
+Restricted mode accepts a function call only if its name is on a built-in list of core PostgreSQL functions, so a query that uses PostGIS (`ST_Length`), MobilityDB (`tDwithin`) or another extension's functions is rejected.
+`--allow-extension-functions` names extensions whose functions the validator should also accept:
+
+```
+postgres-mcp --access-mode=restricted --allow-extension-functions=postgis,mobilitydb
+```
+
+At startup the server reads those extensions' functions from `pg_catalog` and admits a function name only when every function with that name in the database is IMMUTABLE or STABLE, not SECURITY DEFINER, and not a procedure.
+VOLATILE functions such as `AddGeometryColumn` stay rejected, and so do extensions whose functions run SQL passed as text (pgRouting's `pgr_*` are VOLATILE).
+The transaction is still forced read-only; the flag only widens which read functions the parser accepts.
+
+##### Result size (optional)
+
+`--max-rows N` caps the rows `execute_sql` returns and appends `(truncated to N of M rows by --max-rows)`.
+Rows are still fetched from the server, so the cap protects the client's context window, not the database.
+Without the flag every row is returned, as before.
+
 
 #### Other MCP Clients
 
@@ -602,6 +621,7 @@ ROLLBACK; DROP TABLE users;
 
 To prevent cases like this, we parse the SQL before execution using the [pglast](https://pglast.readthedocs.io/) library.
 We reject any SQL that contains `commit` or `rollback` statements.
+Every node of the parse tree is checked, including functions called in a `FROM` clause (`SELECT * FROM some_function(...)`), and a rejection names the node or function that caused it.
 Helpfully, the popular Postgres stored procedure languages, including PL/pgSQL and PL/Python, do not allow for `COMMIT` or `ROLLBACK` statements.
 If you have unsafe stored procedure languages enabled on your database, then our read-only protections could be circumvented.
 

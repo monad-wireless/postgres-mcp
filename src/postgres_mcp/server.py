@@ -60,6 +60,8 @@ db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 # Read-only extension functions accepted in RESTRICTED mode (--allow-extension-functions), discovered at startup.
 extension_functions: frozenset[str] = frozenset()
+# Row cap for execute_sql output (--max-rows); None keeps upstream behaviour (every row).
+max_result_rows: int | None = None
 shutdown_in_progress = False
 
 
@@ -425,7 +427,10 @@ async def execute_sql(
         rows = await sql_driver.execute_query(sql)  # type: ignore
         if rows is None:
             return format_text_response("No results")
-        return format_text_response(list([r.cells for r in rows]))
+        cells = [r.cells for r in rows]
+        if max_result_rows is not None and len(cells) > max_result_rows:
+            return format_text_response(f"{cells[:max_result_rows]}\n(truncated to {max_result_rows} of {len(cells)} rows by --max-rows)")
+        return format_text_response(cells)
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         return format_error_response(str(e))
@@ -579,6 +584,15 @@ async def main():
         ),
     )
     parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help=(
+            "Cap the rows execute_sql returns and append a truncation note (default: no cap). "
+            "Rows are still fetched from the server; the cap protects the client's context, not the database."
+        ),
+    )
+    parser.add_argument(
         "--transport",
         type=str,
         choices=["stdio", "sse", "streamable-http"],
@@ -613,8 +627,11 @@ async def main():
     args = parser.parse_args()
 
     # Store the access mode in the global variable
-    global current_access_mode, extension_functions
+    global current_access_mode, extension_functions, max_result_rows
     current_access_mode = AccessMode(args.access_mode)
+    if args.max_rows is not None and args.max_rows < 1:
+        parser.error("--max-rows must be at least 1")
+    max_result_rows = args.max_rows
     allowed_extensions = parse_extension_list(args.allow_extension_functions)
     if allowed_extensions and current_access_mode != AccessMode.RESTRICTED:
         logger.warning("--allow-extension-functions has no effect outside restricted mode")

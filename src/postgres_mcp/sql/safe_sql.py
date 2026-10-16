@@ -24,6 +24,7 @@ from pglast.ast import CaseWhen
 from pglast.ast import ClosePortalStmt
 from pglast.ast import CoalesceExpr
 from pglast.ast import CollateClause
+from pglast.ast import ColumnDef
 from pglast.ast import ColumnRef
 from pglast.ast import CommonTableExpr
 from pglast.ast import CreateExtensionStmt
@@ -666,6 +667,9 @@ class SafeSqlDriver(SqlDriver):
     }
 
     ALLOWED_NODE_TYPES: ClassVar[set[type]] = ALLOWED_STMT_TYPES | {
+        # Column-definition list of a FROM function, e.g. json_to_recordset(...) AS t(a int).
+        # CREATE TABLE is refused at the statement level, so this is the only place it appears.
+        ColumnDef,
         # Basic SELECT components
         ResTarget,
         ColumnRef,
@@ -977,10 +981,11 @@ class SafeSqlDriver(SqlDriver):
                             )
                     self._validate_node(stmt)
             except Exception as e:
-                raise ValueError(f"Error validating query: {query}") from e
+                # Keep the reason in the message: callers report str(exc), which drops __cause__.
+                raise ValueError(f"Error validating query: {query}\nReason: {e}") from e
 
         except pglast.parser.ParseError as e:
-            raise ValueError("Failed to parse SQL statement") from e
+            raise ValueError(f"Failed to parse SQL statement: {e}") from e
 
     async def execute_query(
         self,

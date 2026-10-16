@@ -15,7 +15,13 @@ startCommand:
       accessMode:
         type: string
         description: The access mode for the MCP, e.g., "restricted" or "unrestricted".
+      allowExtensionFunctions:
+        type: string
+        description: Optional, restricted mode only. Comma-separated extensions whose IMMUTABLE/STABLE functions are accepted, e.g., "postgis,mobilitydb".
+      maxRows:
+        type: integer
+        description: Optional. Cap the rows execute_sql returns; a truncation note is appended.
   commandFunction:
     # A function that produces the CLI command to start the MCP on stdio.
     |-
-    (config) => ({command: '/app/docker-entrypoint.sh', args: ['postgres-mcp', '--access-mode',config.accessMode], env: {DATABASE_URI: config.databaseUri}})
+    (config) => ({command: '/app/docker-entrypoint.sh', args: ['postgres-mcp', '--access-mode', config.accessMode, ...(config.allowExtensionFunctions ? ['--allow-extension-functions', config.allowExtensionFunctions] : []), ...(config.maxRows ? ['--max-rows', String(config.maxRows)] : [])], env: {DATABASE_URI: config.databaseUri}})
