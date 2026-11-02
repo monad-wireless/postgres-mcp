@@ -245,6 +245,32 @@ The transaction is still forced read-only; the flag only widens which read funct
 Rows are still fetched from the server, so the cap protects the client's context window, not the database.
 Without the flag every row is returned, as before.
 
+##### Several databases (optional)
+
+One server can serve several databases, each under a short name:
+
+```
+postgres-mcp --access-mode=restricted \
+  --database gis=postgresql://user:pass@host:5432/monad_gis \
+  --database lake=postgresql://user:pass@host:5432/monad_lake \
+  --default-database gis \
+  --allow-extension-functions=postgis,mobilitydb
+```
+
+Names use lower-case letters, digits, `_` and `-`.
+The server registers databases from three sources, in this order:
+
+1. `DATABASE_URI` or the positional URL, under the name `default`. A single-database configuration keeps working unchanged.
+2. Each `--database NAME=URI`, in command-line order.
+3. Each `DATABASE_URI_<NAME>` environment variable, sorted by name. `<NAME>` is lower-cased, so `DATABASE_URI_LAKE` becomes `lake`. Use this form to keep passwords out of the process list.
+
+A name registered twice is a startup error.
+`--default-database` picks the database a tool uses when the call names none. Without it, the first registered database is the default.
+
+Every database tool takes an optional `database` argument. The `list_databases` tool returns each name with its host, port, dbname, connection state and default flag, without credentials.
+Each database has its own connection pool. The server opens the pools concurrently at startup. A database that cannot be reached is logged and skipped, and the other databases still work.
+`--allow-extension-functions` is discovered per database, so a database without PostGIS does not accept PostGIS function names.
+
 
 #### Other MCP Clients
 
@@ -359,6 +385,7 @@ Postgres MCP Pro Tools:
 
 | Tool Name | Description |
 |-----------|-------------|
+| `list_databases` | Lists the configured databases (name, host, port, dbname, connection state, default flag). Every other tool takes an optional `database` argument naming one of them. |
 | `list_schemas` | Lists all database schemas available in the PostgreSQL instance. |
 | `list_objects` | Lists database objects (tables, views, sequences, extensions) within a specified schema. |
 | `get_object_details` | Provides information about a specific database object, for example, a table's columns, constraints, and indexes. |

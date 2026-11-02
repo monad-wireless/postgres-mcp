@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from postgres_mcp.databases import DatabaseRegistry
 from postgres_mcp.server import AccessMode
 from postgres_mcp.server import get_sql_driver
 from postgres_mcp.sql import SafeSqlDriver
@@ -20,6 +21,8 @@ async def test_force_readonly_enforcement():
     # Create mock for connection pool
     mock_conn_pool = MagicMock()
     mock_conn_pool._is_valid = True
+    registry = DatabaseRegistry([("default", "postgresql://user:password@localhost/db")])
+    registry.get().pool = mock_conn_pool
 
     # Create a mock for the base SqlDriver._execute_with_connection
     mock_execute = AsyncMock()
@@ -28,7 +31,7 @@ async def test_force_readonly_enforcement():
     # Test UNRESTRICTED mode
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.UNRESTRICTED),
-        patch("postgres_mcp.server.db_connection", mock_conn_pool),
+        patch("postgres_mcp.server.databases", registry),
         patch.object(SqlDriver, "_execute_with_connection", mock_execute),
     ):
         driver = await get_sql_driver()
@@ -59,7 +62,7 @@ async def test_force_readonly_enforcement():
     # Test RESTRICTED mode
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.RESTRICTED),
-        patch("postgres_mcp.server.db_connection", mock_conn_pool),
+        patch("postgres_mcp.server.databases", registry),
         patch.object(SqlDriver, "_execute_with_connection", mock_execute),
     ):
         driver = await get_sql_driver()
