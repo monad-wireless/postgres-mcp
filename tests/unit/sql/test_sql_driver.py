@@ -1,4 +1,5 @@
 # ruff: noqa: B017
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import call
@@ -60,10 +61,10 @@ def mock_db_pool():
     cursor = AsyncContextManagerMock()
     cursor.aenter = cursor
 
-    # Setup connection to return cursor
+    # Setup connection to return cursor (cursor() is synchronous in psycopg)
     cursor_cm = AsyncContextManagerMock()
     cursor_cm.aenter = cursor
-    connection.cursor.return_value = cursor_cm
+    connection.cursor = MagicMock(return_value=cursor_cm)
 
     # Configure cursor.description
     cursor.description = ["column1", "column2"]
@@ -81,10 +82,10 @@ def mock_db_pool():
     # Setup pool.connection() to return the connection context manager
     pool.connection.return_value = conn_cm
 
-    # Create mock for DbConnPool
+    # Create mock for DbConnPool: SqlDriver leases through DbConnPool.connection()
     db_pool = MagicMock(spec=DbConnPool)
     db_pool.pool_connect.return_value = pool
-    db_pool._is_valid = True
+    db_pool.connection.return_value = conn_cm
 
     return db_pool, connection, cursor
 
@@ -303,51 +304,54 @@ async def test_execute_query_with_params(mock_connection):
 @pytest.mark.asyncio
 async def test_execute_query_from_pool(mock_db_pool):
     """Test execute_query using a connection from a pool."""
-    db_pool, connection, cursor = mock_db_pool
+    db_pool, _, _ = mock_db_pool
+    cursor = _leased_cursor(db_pool)
+    cursor.fetchall = AsyncMock(return_value=[{"id": 1, "name": "test1"}, {"id": 2, "name": "test2"}])
 
-    # Create a mock execute function
-    async def mock_pool_execute(*args, **kwargs):
-        return [
-            SqlDriver.RowResult(cells={"id": 1, "name": "test1"}),
-            SqlDriver.RowResult(cells={"id": 2, "name": "test2"}),
-        ]
-
-    # Create SqlDriver with the mocked pool
     driver = SqlDriver(conn=db_pool)
-    driver.execute_query = mock_pool_execute
-
-    # Execute a query
     result = await driver.execute_query("SELECT * FROM test")
 
-    # Verify results were processed correctly
+    db_pool.connection.assert_called_once_with()
+    db_pool.pool_connect.assert_not_called()
     assert result is not None
-    assert len(result) == 2
-    assert result[0].cells["id"] == 1
-    assert result[1].cells["name"] == "test2"
+    assert [r.cells for r in result] == [{"id": 1, "name": "test1"}, {"id": 2, "name": "test2"}]
 
 
 @pytest.mark.asyncio
-async def test_connection_error_marks_pool_invalid(mock_db_pool):
-    """Test that connection errors mark the pool as invalid."""
-    db_pool, connection, cursor = mock_db_pool
+async def test_query_error_leaves_the_pool_open(mock_db_pool):
+    """A query error propagates and does not close or invalidate the pool (psycopg_pool owns connection health)."""
+    db_pool, _, _ = mock_db_pool
+    cursor = _leased_cursor(db_pool)
+    cursor.execute = AsyncMock(side_effect=Exception('column "nope" does not exist'))
 
-    # Configure pool_connect to raise an exception
-    db_pool.pool_connect.side_effect = Exception("Connection failed")
-
-    # Create SqlDriver with the mocked pool
     driver = SqlDriver(conn=db_pool)
+    with pytest.raises(Exception, match="nope"):
+        await driver.execute_query("SELECT nope FROM test")
 
-    # Execute a query that will fail due to connection error
-    with pytest.raises(Exception):
-        await driver.execute_query("SELECT * FROM test")
+    db_pool.close.assert_not_called()
+    assert driver.conn is db_pool
 
-    # Make pool invalid manually (since we're bypassing the actual method)
-    db_pool._is_valid = False
-    db_pool._last_error = "Connection failed"
 
-    # Verify pool was marked as invalid
-    assert db_pool._is_valid is False
-    assert isinstance(db_pool._last_error, str)
+def _leased_cursor(db_pool: MagicMock) -> MagicMock:
+    """Make db_pool.connection() yield a connection whose cursor() yields the returned cursor."""
+    cursor = MagicMock()
+    cursor.execute = AsyncMock()
+    cursor.nextset = MagicMock(return_value=None)
+    cursor.description = ["id", "name"]
+
+    @asynccontextmanager
+    async def cursor_cm(*args, **kwargs):
+        yield cursor
+
+    connection = MagicMock()
+    connection.cursor = cursor_cm
+
+    @asynccontextmanager
+    async def lease():
+        yield connection
+
+    db_pool.connection = MagicMock(side_effect=lease)
+    return cursor
 
 
 @pytest.mark.asyncio

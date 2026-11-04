@@ -91,20 +91,23 @@ def test_describe_has_location_and_no_credentials():
         "host": "db.example",
         "port": 5432,
         "dbname": "monad_gis",
-        "connected": False,
-        "extension_functions": 0,
+        "state": "closed",
+        "in_flight": 0,
+        "idle_seconds": None,
+        "last_error": None,
+        "extension_functions": None,
     }
     assert described[1]["default"] is False
     assert "secret" not in repr(described)
 
 
 @pytest.mark.asyncio
-async def test_connect_all_isolates_failures_and_discovers_per_database():
-    registry = DatabaseRegistry([("gis", GIS), ("lake", LAKE)])
+async def test_open_default_opens_only_the_default_and_discovers_it():
+    registry = DatabaseRegistry([("gis", GIS), ("lake", LAKE)], default="lake", allowed_extensions=("postgis",))
+    opened: list[str | None] = []
 
     async def pool_connect(self, connection_url=None):
-        if self.connection_url == LAKE:
-            raise ValueError("Connection attempt failed: postgresql://monad:secret@db.example/monad_lake")
+        opened.append(self.connection_url)
         return MagicMock()
 
     discover = AsyncMock(return_value=frozenset({"st_area"}))
@@ -112,23 +115,47 @@ async def test_connect_all_isolates_failures_and_discovers_per_database():
         patch.object(DbConnPool, "pool_connect", pool_connect),
         patch("postgres_mcp.databases.discover_read_only_functions", discover),
     ):
-        await registry.connect_all(("postgis",))
+        await registry.open_default()
 
-    assert registry.get("gis").extension_functions == frozenset({"st_area"})
-    assert registry.get("lake").extension_functions == frozenset()
-    assert discover.await_count == 1
+    assert opened == [LAKE]
+    assert registry.get("lake").extension_functions == frozenset({"st_area"})
+    assert registry.get("gis").extension_functions is None
 
 
 @pytest.mark.asyncio
-async def test_connect_all_skips_discovery_without_extensions():
-    registry = DatabaseRegistry([("gis", GIS)])
+async def test_open_default_logs_a_failure_without_raising():
+    registry = DatabaseRegistry([("gis", GIS)], allowed_extensions=("postgis",))
     discover = AsyncMock()
+    failing = AsyncMock(side_effect=ValueError("Connection attempt failed"))
     with (
-        patch.object(DbConnPool, "pool_connect", AsyncMock()),
+        patch.object(DbConnPool, "pool_connect", failing),
         patch("postgres_mcp.databases.discover_read_only_functions", discover),
     ):
-        await registry.connect_all(())
+        await registry.open_default()
     discover.assert_not_awaited()
+    assert registry.get("gis").extension_functions is None
+
+
+@pytest.mark.asyncio
+async def test_ready_skips_discovery_without_extensions():
+    registry = DatabaseRegistry([("gis", GIS)])
+    discover = AsyncMock()
+    with patch("postgres_mcp.databases.discover_read_only_functions", discover):
+        db = await registry.ready("gis")
+    discover.assert_not_awaited()
+    assert db.extension_functions == frozenset()
+    assert db.pool.state == "closed"  # ready() never opens a pool by itself
+
+
+@pytest.mark.asyncio
+async def test_ready_retries_discovery_after_a_failure_and_then_caches_it():
+    registry = DatabaseRegistry([("gis", GIS)], allowed_extensions=("postgis",))
+    discover = AsyncMock(side_effect=[ValueError("Connection attempt failed"), frozenset({"st_area"})])
+    with patch("postgres_mcp.databases.discover_read_only_functions", discover):
+        assert (await registry.ready()).extension_functions is None
+        assert (await registry.ready()).extension_functions == frozenset({"st_area"})
+        await registry.ready()
+    assert discover.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -149,6 +176,29 @@ async def test_get_sql_driver_uses_the_named_database_pool_and_allowlist():
     assert isinstance(default.sql_driver, SqlDriver) and default.sql_driver.conn is registry.get("gis").pool
     assert gis.extra_functions == frozenset({"st_area"})
     assert lake.extra_functions == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_main_wires_pool_flags_into_the_registry(monkeypatch):
+    monkeypatch.delenv("DATABASE_URI", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["postgres_mcp", "--database", "gis=" + GIS, "--pool-max-size", "3", "--max-open-pools", "2", "--pool-idle-ttl", "60"],
+    )
+    original = server.databases
+    try:
+        with (
+            patch.object(DbConnPool, "pool_connect", AsyncMock()),
+            patch("postgres_mcp.server.mcp.run_stdio_async", AsyncMock()),
+        ):
+            await server.main()
+        assert server.databases.get("gis").pool.settings.max_size == 3
+        assert server.databases.budget.max_open_pools == 2
+        assert server.databases.budget.idle_ttl == 60
+        assert server.databases.get("gis").pool.budget is server.databases.budget
+    finally:
+        server.databases = original
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,9 @@
 
 A database is configured under a short name and gets its own connection pool and its own
 restricted-mode extension-function allowlist (``--allow-extension-functions`` is discovered per
-database, because one database may have PostGIS installed and the next may not).
+database, because one database may have PostGIS installed and the next may not). Pools open on
+first use and share one ``PoolBudget``, so many configured databases cost connections only while
+they are in use.
 
 Sources, in the order they are registered:
 
@@ -29,6 +31,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .sql import DbConnPool
+from .sql import PoolBudget
+from .sql import PoolSettings
 from .sql import SqlDriver
 from .sql import discover_read_only_functions
 from .sql import obfuscate_password
@@ -84,15 +88,38 @@ def collect_database_urls(
 
 @dataclass
 class Database:
-    """One configured database: its pool and its restricted-mode function allowlist."""
+    """One configured database: its lazily opened pool and its restricted-mode function allowlist.
+
+    ``extension_functions`` is ``None`` until discovery succeeds. It lives here and not on the pool,
+    so a pool that the budget evicts and later reopens does not rerun the catalogue query.
+    """
 
     name: str
     url: str
     pool: DbConnPool
-    extension_functions: frozenset[str] = field(default_factory=frozenset)
+    extension_functions: frozenset[str] | None = None
+    _discovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False, compare=False)
+
+    async def ensure_discovered(self, allowed_extensions: tuple[str, ...]) -> None:
+        """Discover the extension-function allowlist once; on failure stay undiscovered and retry next call.
+
+        Until discovery succeeds the allowlist is empty, which is the strictest validator setting.
+        """
+        if self.extension_functions is not None:
+            return
+        if not allowed_extensions:
+            self.extension_functions = frozenset()
+            return
+        async with self._discovery_lock:
+            if self.extension_functions is not None:
+                return
+            try:
+                self.extension_functions = await discover_read_only_functions(SqlDriver(conn=self.pool), allowed_extensions)
+            except Exception as e:
+                logger.warning(f"Extension discovery on {self.name!r} failed, will retry: {obfuscate_password(str(e))}")
 
     def describe(self, is_default: bool) -> dict[str, Any]:
-        """Name, location and state, without credentials."""
+        """Name, location and pool state, without credentials."""
         parsed = urlparse(self.url)
         return {
             "name": self.name,
@@ -100,16 +127,33 @@ class Database:
             "host": parsed.hostname,
             "port": parsed.port,
             "dbname": parsed.path.lstrip("/") or None,
-            "connected": self.pool.is_valid,
-            "extension_functions": len(self.extension_functions),
+            **self.pool.describe(),
+            "extension_functions": None if self.extension_functions is None else len(self.extension_functions),
         }
 
 
 class DatabaseRegistry:
-    """The databases this server can reach, by name, with one default."""
+    """The databases this server can reach, by name, with one default.
 
-    def __init__(self, pairs: Sequence[tuple[str, str]] = (), default: str | None = None):
-        self._databases: dict[str, Database] = {name: Database(name=name, url=url, pool=DbConnPool(url)) for name, url in pairs}
+    Every database gets a ``DbConnPool`` at construction, but no pool opens until a tool call needs
+    it. All pools share one ``PoolBudget``, which caps how many are open at once and retires the
+    least recently used idle one (see ``PoolBudget`` for the invariants).
+    """
+
+    def __init__(
+        self,
+        pairs: Sequence[tuple[str, str]] = (),
+        default: str | None = None,
+        *,
+        settings: PoolSettings | None = None,
+        budget: PoolBudget | None = None,
+        allowed_extensions: tuple[str, ...] = (),
+    ):
+        self.budget = budget or PoolBudget()
+        self.allowed_extensions = allowed_extensions
+        self._databases: dict[str, Database] = {
+            name: Database(name=name, url=url, pool=DbConnPool(url, settings=settings, budget=self.budget)) for name, url in pairs
+        }
         if default is not None and default not in self._databases:
             raise ValueError(f"--default-database {default!r} is not configured; configured: {', '.join(self._databases) or 'none'}")
         self.default_name: str | None = default if default is not None else next(iter(self._databases), None)
@@ -137,24 +181,28 @@ class DatabaseRegistry:
     def describe(self) -> list[dict[str, Any]]:
         return [db.describe(db.name == self.default_name) for db in self]
 
-    async def connect_all(self, allowed_extensions: tuple[str, ...]) -> None:
-        """Open every pool concurrently; discover extension functions where the pool opened.
+    async def ready(self, name: str | None = None) -> Database:
+        """The named (or default) database with its allowlist discovered. The pool opens on first query."""
+        db = self.get(name)
+        await db.ensure_discovered(self.allowed_extensions)
+        return db
 
-        A database that cannot be reached is logged and skipped: the server still starts and the
-        other databases work. Its pool reconnects lazily on the next query, but its extension
-        functions stay undiscovered until the server restarts (same as the single-database server).
+    async def open_default(self) -> None:
+        """Open the default database at startup, so a wrong URL shows in the log before the first tool call.
+
+        A failure is logged, not raised: the server starts and the pool retries on the next query.
+        The other databases open on first use.
         """
-        await asyncio.gather(*(self._connect_one(db, allowed_extensions) for db in self))
-
-    async def _connect_one(self, db: Database, allowed_extensions: tuple[str, ...]) -> None:
+        if self.default_name is None:
+            return
+        db = self._databases[self.default_name]
         try:
             await db.pool.pool_connect()
-            logger.info(f"Connected to database {db.name!r}")
-            if allowed_extensions:
-                db.extension_functions = await discover_read_only_functions(SqlDriver(conn=db.pool), allowed_extensions)
+            logger.info(f"Connected to default database {db.name!r}")
+            await db.ensure_discovered(self.allowed_extensions)
         except Exception as e:
             logger.warning(f"Could not connect to database {db.name!r}: {obfuscate_password(str(e))}")
-            logger.warning(f"The MCP server will start but operations on {db.name!r} will fail until a valid connection is established.")
+            logger.warning(f"The MCP server will start; {db.name!r} will retry on the next query.")
 
     async def close_all(self) -> None:
         for db in self:

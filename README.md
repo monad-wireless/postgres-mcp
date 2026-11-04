@@ -267,9 +267,22 @@ The server registers databases from three sources, in this order:
 A name registered twice is a startup error.
 `--default-database` picks the database a tool uses when the call names none. Without it, the first registered database is the default.
 
-Every database tool takes an optional `database` argument. The `list_databases` tool returns each name with its host, port, dbname, connection state and default flag, without credentials.
-Each database has its own connection pool. The server opens the pools concurrently at startup. A database that cannot be reached is logged and skipped, and the other databases still work.
-`--allow-extension-functions` is discovered per database, so a database without PostGIS does not accept PostGIS function names.
+Every database tool takes an optional `database` argument. The `list_databases` tool returns each name with its host, port, dbname, default flag, pool state (`closed`, `open` or `failed`), queries in flight, idle seconds and last error, without credentials.
+`--allow-extension-functions` is discovered per database, so a database without PostGIS does not accept PostGIS function names. Discovery runs on the first call to that database and its result is kept, so `extension_functions` shows `null` until then.
+
+##### Connection pools (optional)
+
+Each database has its own pool, and a pool opens only when a tool call needs it. At startup the server opens the default database alone, so a wrong URL shows in the log at once. A database that cannot be reached is logged, and the next call to it tries again.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--pool-max-size N` | 5 | Connections per pool. A pool keeps no idle connection (`min_size=0`). |
+| `--pool-max-idle S` | 300 | psycopg_pool closes a connection idle for S seconds. The next call opens a new one. |
+| `--connect-timeout S` | 10 | Bound on opening a pool and getting its first connection. |
+| `--max-open-pools N` | 8 | Open pools kept at once. Past it, the least recently used idle pool closes. |
+| `--pool-idle-ttl S` | 900 | A pool unused for S seconds closes at the next tool call. |
+
+A pool with a query in flight never closes. If every open pool is busy, a new pool opens beyond `--max-open-pools` and the server logs a warning. Outside that case the server holds at most `max-open-pools × pool-max-size` connections. A query error leaves its pool open: psycopg_pool checks each connection at checkout and replaces a broken one.
 
 
 #### Other MCP Clients

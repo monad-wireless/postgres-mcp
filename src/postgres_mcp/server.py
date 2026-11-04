@@ -31,6 +31,8 @@ from .explain import ExplainPlanTool
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
+from .sql import PoolBudget
+from .sql import PoolSettings
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
@@ -74,12 +76,13 @@ DatabaseName = Annotated[
 
 async def get_sql_driver(database: str | None = None) -> Union[SqlDriver, SafeSqlDriver]:
     """Get the SQL driver for the named (or default) database, based on the current access mode."""
-    db = databases.get(database)
+    db = await databases.ready(database)
     base_driver = SqlDriver(conn=db.pool)
 
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug(f"Using SafeSqlDriver with restrictions (RESTRICTED mode) on database {db.name!r}")
-        return SafeSqlDriver(sql_driver=base_driver, timeout=30, extra_functions=db.extension_functions)  # 30 second timeout
+        extra = db.extension_functions or frozenset()
+        return SafeSqlDriver(sql_driver=base_driver, timeout=30, extra_functions=extra)  # 30 second timeout
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
@@ -645,6 +648,37 @@ async def main():
             "Rows are still fetched from the server; the cap protects the client's context, not the database."
         ),
     )
+    pool_defaults = PoolSettings()
+    parser.add_argument(
+        "--pool-max-size",
+        type=int,
+        default=pool_defaults.max_size,
+        help=f"Connections per database pool (default: {pool_defaults.max_size}). Pools open on first use and hold no idle connection.",
+    )
+    parser.add_argument(
+        "--pool-max-idle",
+        type=float,
+        default=pool_defaults.max_idle,
+        help=f"Seconds before psycopg_pool closes an idle connection (default: {pool_defaults.max_idle:g})",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=pool_defaults.connect_timeout,
+        help=f"Seconds to open a pool and get its first connection (default: {pool_defaults.connect_timeout:g})",
+    )
+    parser.add_argument(
+        "--max-open-pools",
+        type=int,
+        default=8,
+        help="Open pools kept at once; past it the least recently used idle pool closes (default: 8)",
+    )
+    parser.add_argument(
+        "--pool-idle-ttl",
+        type=float,
+        default=900.0,
+        help="Seconds an unused pool stays open before the next tool call closes it (default: 900)",
+    )
     parser.add_argument(
         "--transport",
         type=str,
@@ -719,7 +753,13 @@ async def main():
             environ=os.environ,
         )
         default_name = validate_name(args.default_database) if args.default_database is not None else None
-        databases = DatabaseRegistry(pairs, default=default_name)
+        databases = DatabaseRegistry(
+            pairs,
+            default=default_name,
+            settings=PoolSettings(max_size=args.pool_max_size, max_idle=args.pool_max_idle, connect_timeout=args.connect_timeout),
+            budget=PoolBudget(max_open_pools=args.max_open_pools, idle_ttl=args.pool_idle_ttl),
+            allowed_extensions=allowed_extensions if current_access_mode == AccessMode.RESTRICTED else (),
+        )
     except ValueError as e:
         parser.error(str(e))
 
@@ -730,9 +770,8 @@ async def main():
         )
     logger.info(f"Configured databases: {', '.join(databases.names)} (default: {databases.default_name})")
 
-    # Open every pool concurrently; discover each database's own extension-function allowlist
-    restricted_extensions = allowed_extensions if current_access_mode == AccessMode.RESTRICTED else ()
-    await databases.connect_all(restricted_extensions)
+    # Open only the default pool now; every other database opens on its first tool call
+    await databases.open_default()
 
     # Set up proper shutdown handling
     try:

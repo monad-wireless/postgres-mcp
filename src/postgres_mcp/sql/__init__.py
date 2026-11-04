@@ -13,6 +13,8 @@ from .extension_utils import reset_postgres_version_cache
 from .index import IndexDefinition
 from .safe_sql import SafeSqlDriver
 from .sql_driver import DbConnPool
+from .sql_driver import PoolBudget
+from .sql_driver import PoolSettings
 from .sql_driver import SqlDriver
 from .sql_driver import obfuscate_password
 
@@ -20,6 +22,8 @@ __all__ = [
     "ColumnCollector",
     "DbConnPool",
     "IndexDefinition",
+    "PoolBudget",
+    "PoolSettings",
     "SafeSqlDriver",
     "SqlBindParams",
     "SqlDriver",

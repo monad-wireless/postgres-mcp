@@ -114,9 +114,12 @@ async def test_pool_connect_all_retries_fail(mock_pool):
             with pytest.raises(Exception):
                 await db_pool.pool_connect()
 
-            # Verify the pool is marked as invalid
-            assert db_pool._is_valid is False  # type: ignore
-            # Verify open was called at least once (no need to verify retries here)
+            # Verify the pool is marked as failed and the half-built pool was closed
+            assert db_pool.is_valid is False
+            assert db_pool.state == "failed"
+            assert db_pool.pool is None
+            mock_pool.close.assert_awaited_once()
+            assert "pass" not in (db_pool.last_error or "")
             assert mock_pool.open.call_count >= 1
 
 
@@ -130,13 +133,13 @@ async def test_close_pool(mock_pool):
         db_pool.pool_connect = AsyncMock(return_value=mock_pool)
         await db_pool.pool_connect()
         db_pool.pool = mock_pool  # Set directly
-        db_pool._is_valid = True  # type: ignore
+        db_pool.state = "open"
 
         # Close the pool
         await db_pool.close()
 
         # Check that pool is now invalid
-        assert db_pool._is_valid is False  # type: ignore
+        assert db_pool.is_valid is False
         assert db_pool.pool is None
         mock_pool.close.assert_called_once()
 
@@ -153,13 +156,13 @@ async def test_close_handles_errors(mock_pool):
         db_pool.pool_connect = AsyncMock(return_value=mock_pool)
         await db_pool.pool_connect()
         db_pool.pool = mock_pool  # Set directly
-        db_pool._is_valid = True  # type: ignore
+        db_pool.state = "open"
 
         # Close should not raise the exception
         await db_pool.close()
 
         # Pool should still be marked as invalid
-        assert db_pool._is_valid is False  # type: ignore
+        assert db_pool.is_valid is False
         assert db_pool.pool is None
 
 
