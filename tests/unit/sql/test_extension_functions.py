@@ -32,6 +32,38 @@ def test_parse_extension_list():
         parse_extension_list("postgis; DROP TABLE x")
 
 
+def test_parse_extension_list_accepts_hyphens_and_a_lone_star():
+    assert parse_extension_list("uuid-ossp,hstore") == ("hstore", "uuid-ossp")
+    assert parse_extension_list(" * ") == ("*",)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        parse_extension_list("*,postgis")
+    with pytest.raises(ValueError):
+        parse_extension_list("-leading")
+
+
+@pytest.mark.asyncio
+async def test_star_resolves_to_installed_known_extensions_first():
+    inner = _driver()
+    inner.execute_query = AsyncMock(
+        side_effect=[
+            [SqlDriver.RowResult(cells={"extname": "hstore"}), SqlDriver.RowResult(cells={"extname": "uuid-ossp"})],
+            [SqlDriver.RowResult(cells={"name": "akeys"})],
+        ]
+    )
+    assert await discover_read_only_functions(inner, ("*",)) == frozenset({"akeys"})
+    first, second = inner.execute_query.await_args_list
+    assert "pg_extension" in first.args[0]
+    assert sorted(SafeSqlDriver.ALLOWED_EXTENSIONS) == first.kwargs["params"][0]
+    assert second.kwargs["params"] == [["hstore", "uuid-ossp"]]
+
+
+@pytest.mark.asyncio
+async def test_star_with_nothing_installed_admits_nothing():
+    inner = _driver()
+    assert await discover_read_only_functions(inner, ("*",)) == frozenset()
+    assert inner.execute_query.await_count == 1
+
+
 @pytest.mark.asyncio
 async def test_extension_functions_rejected_without_opt_in():
     safe = SafeSqlDriver(_driver())
@@ -94,5 +126,6 @@ async def test_discovery_without_extensions_queries_nothing():
 
 def test_discovery_query_excludes_unsafe_overloads():
     q = DISCOVERY_QUERY
-    assert "provolatile = 'v'" in q and "prosecdef" in q and "prokind <> 'f'" in q
+    assert "provolatile = 'v'" in q and "prosecdef" in q and "prokind NOT IN ('f', 'a')" in q
     assert "NOT EXISTS" in q  # one unsafe overload anywhere keeps the name out
+    assert "pg_aggregate" in q and "aggtransfn" in q and "aggfinalfn" in q  # aggregates checked through their support functions

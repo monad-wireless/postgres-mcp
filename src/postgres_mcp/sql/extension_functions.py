@@ -11,7 +11,15 @@ database with that name is safe:
 - IMMUTABLE or STABLE (``provolatile`` in ``i``/``s``). VOLATILE functions are excluded, which drops
   writers such as ``AddGeometryColumn`` or ``UpdateGeometrySRID``.
 - not SECURITY DEFINER (``prosecdef``), so the call runs with the caller's own privileges.
-- a plain function (``prokind = 'f'``), not a procedure.
+- a plain function (``prokind = 'f'``) or an aggregate (``'a'``), not a procedure or window
+  function. An aggregate passes only if every support function it calls (transition, final,
+  combine, serialise, moving-aggregate) passes the same volatility and SECURITY DEFINER test:
+  pgvector's ``avg(vector)`` qualifies, an aggregate with a volatile transition function does not.
+
+``*`` admits every extension installed in that database that is also in
+``SafeSqlDriver.ALLOWED_EXTENSIONS``; it is resolved per database at discovery, so each database
+gets its own set. Extension names may contain hyphens (``uuid-ossp``); they reach the query as a
+bound parameter.
 
 The check is by name across all schemas because the validator matches unqualified names: if any
 overload anywhere is unsafe, the name stays out. Extensions whose functions execute SQL passed as text
@@ -29,11 +37,13 @@ import re
 
 from typing_extensions import LiteralString
 
+from .safe_sql import SafeSqlDriver
 from .sql_driver import SqlDriver
 
 logger = logging.getLogger(__name__)
 
-_EXTENSION_NAME = re.compile(r"^[a-z0-9_]+$")
+_EXTENSION_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+ALL_INSTALLED = "*"
 
 DISCOVERY_QUERY: LiteralString = """
 WITH ext_funcs AS (
@@ -49,30 +59,54 @@ WITH ext_funcs AS (
 SELECT f.name
 FROM ext_funcs f
 WHERE NOT EXISTS (
-    SELECT 1 FROM pg_catalog.pg_proc q
+    SELECT 1
+    FROM pg_catalog.pg_proc q
+    LEFT JOIN pg_catalog.pg_aggregate a ON a.aggfnoid = q.oid
     WHERE lower(q.proname) = f.name
-      AND (q.provolatile = 'v' OR q.prosecdef OR q.prokind <> 'f')
+      AND (
+        q.provolatile = 'v' OR q.prosecdef OR q.prokind NOT IN ('f', 'a')
+        OR (q.prokind = 'a' AND EXISTS (
+              SELECT 1 FROM pg_catalog.pg_proc s
+              WHERE s.oid IN (a.aggtransfn::oid, a.aggfinalfn::oid, a.aggcombinefn::oid, a.aggserialfn::oid,
+                              a.aggdeserialfn::oid, a.aggmtransfn::oid, a.aggminvtransfn::oid, a.aggmfinalfn::oid)
+                AND (s.provolatile = 'v' OR s.prosecdef)))
+      )
 )
 ORDER BY f.name
 """
 
+INSTALLED_QUERY: LiteralString = "SELECT extname FROM pg_catalog.pg_extension WHERE extname = ANY(%s) ORDER BY extname"
+
 
 def parse_extension_list(value: str | None) -> tuple[str, ...]:
-    """Split ``postgis,mobilitydb`` into validated, lower-case extension names."""
+    """Split ``postgis,uuid-ossp`` into validated, lower-case extension names; ``*`` stands alone."""
     if not value:
         return ()
     names = tuple(sorted({part.strip().lower() for part in value.split(",") if part.strip()}))
+    if ALL_INSTALLED in names:
+        if len(names) > 1:
+            raise ValueError("'*' admits every installed extension and cannot be combined with names")
+        return (ALL_INSTALLED,)
     for name in names:
         if not _EXTENSION_NAME.match(name):
             raise ValueError(f"invalid extension name: {name!r}")
     return names
 
 
+async def resolve_extensions(sql_driver: SqlDriver, extensions: tuple[str, ...]) -> tuple[str, ...]:
+    """``("*",)`` becomes the installed extensions that ``SafeSqlDriver.ALLOWED_EXTENSIONS`` lists."""
+    if extensions != (ALL_INSTALLED,):
+        return extensions
+    rows = await sql_driver.execute_query(INSTALLED_QUERY, params=[sorted(SafeSqlDriver.ALLOWED_EXTENSIONS)], force_readonly=True)
+    return tuple(str(row.cells["extname"]) for row in rows or [])
+
+
 async def discover_read_only_functions(sql_driver: SqlDriver, extensions: tuple[str, ...]) -> frozenset[str]:
-    """Names of the safe functions owned by ``extensions``; empty when none are named."""
-    if not extensions:
+    """Names of the safe functions owned by ``extensions``; empty when none are named or installed."""
+    resolved = await resolve_extensions(sql_driver, extensions)
+    if not resolved:
         return frozenset()
-    rows = await sql_driver.execute_query(DISCOVERY_QUERY, params=[list(extensions)], force_readonly=True)
+    rows = await sql_driver.execute_query(DISCOVERY_QUERY, params=[list(resolved)], force_readonly=True)
     names = frozenset(str(row.cells["name"]) for row in rows or [])
-    logger.info(f"Allowing {len(names)} read-only functions from extensions: {', '.join(extensions)}")
+    logger.info(f"Allowing {len(names)} read-only functions from extensions: {', '.join(resolved)}")
     return names

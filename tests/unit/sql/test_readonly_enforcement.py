@@ -24,7 +24,7 @@ async def test_force_readonly_enforcement():
     registry = DatabaseRegistry([("default", "postgresql://user:password@localhost/db")])
     registry.get().pool = mock_conn_pool
 
-    # Create a mock for the base SqlDriver._execute_with_connection
+    # Create a mock for the base SqlDriver._run_on_connection (every query path ends there)
     mock_execute = AsyncMock()
     mock_execute.return_value = [SqlDriver.RowResult(cells={"test": "value"})]
 
@@ -32,7 +32,7 @@ async def test_force_readonly_enforcement():
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.UNRESTRICTED),
         patch("postgres_mcp.server.databases", registry),
-        patch.object(SqlDriver, "_execute_with_connection", mock_execute),
+        patch.object(SqlDriver, "_run_on_connection", mock_execute),
     ):
         driver = await get_sql_driver()
         assert isinstance(driver, SqlDriver)
@@ -63,7 +63,7 @@ async def test_force_readonly_enforcement():
     with (
         patch("postgres_mcp.server.current_access_mode", AccessMode.RESTRICTED),
         patch("postgres_mcp.server.databases", registry),
-        patch.object(SqlDriver, "_execute_with_connection", mock_execute),
+        patch.object(SqlDriver, "_run_on_connection", mock_execute),
     ):
         driver = await get_sql_driver()
         assert isinstance(driver, SafeSqlDriver)

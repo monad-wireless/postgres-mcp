@@ -235,15 +235,37 @@ Restricted mode accepts a function call only if its name is on a built-in list o
 postgres-mcp --access-mode=restricted --allow-extension-functions=postgis,mobilitydb
 ```
 
-At startup the server reads those extensions' functions from `pg_catalog` and admits a function name only when every function with that name in the database is IMMUTABLE or STABLE, not SECURITY DEFINER, and not a procedure.
+On the first call to a database the server reads those extensions' functions from `pg_catalog`. It admits a function name only when every function with that name in the database is IMMUTABLE or STABLE, not SECURITY DEFINER, and a plain function or an aggregate.
+An aggregate also needs every support function it calls (transition, final, combine and the moving-aggregate ones) to pass the same test.
 VOLATILE functions such as `AddGeometryColumn` stay rejected, and so do extensions whose functions run SQL passed as text (pgRouting's `pgr_*` are VOLATILE).
 The transaction is still forced read-only; the flag only widens which read functions the parser accepts.
 
-##### Result size (optional)
+Names may contain hyphens (`uuid-ossp`). `--allow-extension-functions=*` admits every extension that is installed in that database and known to the server's extension list, resolved per database; `*` cannot be combined with names.
 
-`--max-rows N` caps the rows `execute_sql` returns and appends `(truncated to N of M rows by --max-rows)`.
-Rows are still fetched from the server, so the cap protects the client's context window, not the database.
-Without the flag every row is returned, as before.
+Operators are not checked against the function list. `identifiers -> 'isbn'`, `identifiers ? 'doi'` and `a.embedding <=> b.embedding` run even when the functions of the same extension are refused. This is safe because the transaction is still read-only, and the "Function X is not allowed" error says so and names the flag.
+
+In restricted mode the server checks at the first connection whether the login role is a superuser. `list_databases` shows `"superuser": true`, and the log carries a warning. `--refuse-superuser` makes such a database fail to open instead. A role with `pg_read_all_data` and `pg_read_all_stats` is the safer login.
+
+##### Result format and size (optional)
+
+`execute_sql` returns JSON:
+
+```json
+{"columns": [{"name": "a", "type": "int4"}, {"name": "a", "type": "int4"}], "row_count": 1, "rows": [[1, 2]]}
+```
+
+Duplicate column names are kept, and each column carries its type name. Values map to JSON as follows: `numeric` becomes a string (precision kept, `"NaN"`), float NaN and infinities become `"NaN"`, `"Infinity"` and `"-Infinity"`, timestamps become ISO 8601 with the offset, `bytea` becomes `"\\x…"` hex, ranges become `{"lower", "upper", "bounds", "empty"}`, records become lists, and `hstore` becomes an object.
+`'infinity'` dates and timestamps come back as the strings `"infinity"` and `"-infinity"` instead of failing the query. Intervals come back as the text PostgreSQL prints (`"1 mon 2 days"`), so months and years are not rounded to days.
+pgvector values longer than `--vector-preview` components print as `{"dims": 768, "preview": [...]}`. Cast to text (`embedding::text`) for the full value.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--max-rows N` | 500 | Rows returned; a `note` says when more exist. The server still sends the whole result, so this bounds conversion and the response, not the transfer. |
+| `--max-cell-chars N` | 2000 | Longer text, JSON and `bytea` cells are cut and end in `…[truncated N chars]`. |
+| `--max-result-bytes N` | 262144 | Rows past this response size are dropped, with a `note`. |
+| `--vector-preview N` | 8 | pgvector components printed before the value is summarised. |
+
+`0` disables any of the four. The other tools also return JSON instead of Python literals.
 
 ##### Several databases (optional)
 

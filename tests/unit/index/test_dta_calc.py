@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 from pglast import parse_sql
+from pglast.ast import SelectStmt
 
 from postgres_mcp.artifacts import ExplainPlanArtifact
 from postgres_mcp.index.dta_calc import ColumnCollector
@@ -1080,7 +1081,9 @@ async def test_enumerate_greedy_pareto_cost_benefit(async_sql_driver):
 
     # Create test queries
     q1 = "SELECT * FROM test_table WHERE col1 = 1"
-    queries = [(q1, parse_sql(q1)[0].stmt, 1.0)]
+    stmt = parse_sql(q1)[0].stmt
+    assert isinstance(stmt, SelectStmt)
+    queries = [(q1, stmt, 1.0)]
 
     # Create candidate indexes
     candidate_indexes = set()

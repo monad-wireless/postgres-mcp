@@ -32,6 +32,7 @@ class FakeRawPool:
     """Stands in for psycopg_pool.AsyncConnectionPool."""
 
     built: ClassVar[list["FakeRawPool"]] = []
+    superuser: ClassVar[bool] = False  # what the role probe reports
 
     def __init__(self, conninfo: str = "", **kwargs: Any) -> None:
         self.conninfo = conninfo
@@ -55,6 +56,7 @@ class FakeRawPool:
     async def connection(self, timeout: float | None = None):
         conn = MagicMock()
         cursor = AsyncMock()
+        cursor.fetchone = AsyncMock(return_value=(FakeRawPool.superuser,))
 
         @asynccontextmanager
         async def cursor_cm(*args: Any, **kwargs: Any):
@@ -67,6 +69,7 @@ class FakeRawPool:
 @pytest.fixture(autouse=True)
 def fake_pool_class():
     FakeRawPool.built = []
+    FakeRawPool.superuser = False
     with patch("postgres_mcp.sql.sql_driver.AsyncConnectionPool", FakeRawPool):
         yield
 
@@ -100,7 +103,28 @@ async def test_pool_is_built_with_the_settings_and_a_health_check():
     assert raw.kwargs["max_idle"] == 42.0
     assert raw.kwargs["kwargs"] == {"connect_timeout": 7}
     assert raw.kwargs["check"] is FakeRawPool.check_connection
+    assert callable(raw.kwargs["configure"])
     assert raw.kwargs["open"] is False and raw.opened
+    assert pool.superuser is False
+
+
+@pytest.mark.asyncio
+async def test_superuser_login_is_reported_and_warned_by_default(caplog):
+    FakeRawPool.superuser = True
+    pool = DbConnPool("postgresql://u:pw@h/db", settings=PoolSettings(superuser="warn"))
+    await _use(pool)
+    assert pool.state == "open" and pool.superuser is True
+    assert pool.describe()["superuser"] is True
+    assert "superuser" in caplog.text and "pw" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_superuser_login_is_refused_when_asked():
+    FakeRawPool.superuser = True
+    pool = DbConnPool("postgresql://u:pw@h/db", settings=PoolSettings(superuser="refuse"))
+    with pytest.raises(ValueError, match="--refuse-superuser"):
+        await _use(pool)
+    assert pool.state == "failed" and FakeRawPool.built[0].closed
 
 
 @pytest.mark.asyncio

@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable
+from collections.abc import Callable
 from typing import Any
 from typing import ClassVar
 from typing import Optional
+from typing import TypeVar
 
 import pglast
 from pglast.ast import A_ArrayExpr
@@ -81,9 +84,12 @@ from psycopg.sql import Composable
 from psycopg.sql import Literal
 from typing_extensions import LiteralString
 
+from .json_output import QueryTable
 from .sql_driver import SqlDriver
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class SafeSqlDriver(SqlDriver):
@@ -910,7 +916,11 @@ class SafeSqlDriver(SqlDriver):
             match = self.PG_CATALOG_PATTERN.match(func_name)
             unqualified_name = match.group(1) if match else func_name
             if unqualified_name not in self.ALLOWED_FUNCTIONS and unqualified_name not in self.extra_functions:
-                raise ValueError(f"Function {func_name} is not allowed")
+                raise ValueError(
+                    f"Function {func_name} is not allowed. If an installed extension owns it, start the server with "
+                    "--allow-extension-functions=<extension> (or '*') to admit that extension's read-only functions. "
+                    "Operators are not checked against this list, so an operator of the same extension can still run."
+                )
 
         # Reject SELECT statements with locking clauses
         if isinstance(node, SelectStmt) and getattr(node, "lockingClause", None):
@@ -994,32 +1004,36 @@ class SafeSqlDriver(SqlDriver):
         force_readonly: bool = True,  # do not use value passed in
     ) -> Optional[list[SqlDriver.RowResult]]:  # noqa: UP007
         """Execute a query after validating it is safe"""
-        self._validate(query)
-
         # NOTE: Always force readonly=True in SafeSqlDriver regardless of what was passed
-        if self.timeout:
-            try:
-                async with asyncio.timeout(self.timeout):
-                    return await self.sql_driver.execute_query(
-                        f"/* crystaldba */ {query}",
-                        params=params,
-                        force_readonly=True,
-                    )
-            except asyncio.TimeoutError as e:
-                logger.warning(f"Query execution timed out after {self.timeout} seconds: {query[:100]}...")
-                raise ValueError(
-                    f"Query execution timed out after {self.timeout} seconds in restricted mode. "
-                    "Consider simplifying your query or increasing the timeout."
-                ) from e
-            except Exception as e:
-                logger.error(f"Error executing query: {e}")
-                raise
-        else:
-            return await self.sql_driver.execute_query(
-                f"/* crystaldba */ {query}",
-                params=params,
-                force_readonly=True,
-            )
+        return await self._guarded(query, lambda q: self.sql_driver.execute_query(q, params=params, force_readonly=True))
+
+    async def execute_table(
+        self,
+        query: LiteralString,
+        params: list[Any] | None = None,
+        force_readonly: bool = True,  # do not use value passed in
+        max_rows: int | None = None,
+    ) -> QueryTable | None:
+        """``SqlDriver.execute_table`` after the same validation, timeout and forced read-only transaction."""
+        return await self._guarded(query, lambda q: self.sql_driver.execute_table(q, params=params, force_readonly=True, max_rows=max_rows))
+
+    async def _guarded(self, query: LiteralString, run: Callable[[LiteralString], Awaitable[T]]) -> T:
+        self._validate(query)
+        tagged: LiteralString = f"/* crystaldba */ {query}"
+        if not self.timeout:
+            return await run(tagged)
+        try:
+            async with asyncio.timeout(self.timeout):
+                return await run(tagged)
+        except asyncio.TimeoutError as e:
+            logger.warning(f"Query execution timed out after {self.timeout} seconds: {query[:100]}...")
+            raise ValueError(
+                f"Query execution timed out after {self.timeout} seconds in restricted mode. "
+                "Consider simplifying your query or increasing the timeout."
+            ) from e
+        except Exception as e:
+            logger.error(f"Error executing query: {e}")
+            raise
 
     @staticmethod
     def sql_to_query(sql: Composable) -> str:

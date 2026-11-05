@@ -37,6 +37,10 @@ from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import parse_extension_list
+from .sql.json_output import OutputLimits
+from .sql.json_output import dumps
+from .sql.json_output import render_table
+from .sql.sql_driver import SuperuserPolicy
 from .top_queries import TopQueriesCalc
 
 # Initialize FastMCP with default settings
@@ -63,8 +67,8 @@ class AccessMode(str, Enum):
 # Each entry carries its own pool and its own restricted-mode extension-function allowlist.
 databases = DatabaseRegistry()
 current_access_mode = AccessMode.UNRESTRICTED
-# Row cap for execute_sql output (--max-rows); None keeps upstream behaviour (every row).
-max_result_rows: int | None = None
+# Bounds on execute_sql output (--max-rows, --max-cell-chars, --max-result-bytes, --vector-preview).
+output_limits = OutputLimits()
 shutdown_in_progress = False
 
 # Optional per-call database selector shared by every database tool.
@@ -89,8 +93,8 @@ async def get_sql_driver(database: str | None = None) -> Union[SqlDriver, SafeSq
 
 
 def format_text_response(text: Any) -> ResponseType:
-    """Format a text response."""
-    return [types.TextContent(type="text", text=str(text))]
+    """A string passes through as written; any other value is serialised as JSON (never a Python repr)."""
+    return [types.TextContent(type="text", text=text if isinstance(text, str) else dumps(text, output_limits.vector_preview))]
 
 
 def format_error_response(error: str) -> ResponseType:
@@ -453,13 +457,10 @@ async def execute_sql(
     """Executes a SQL query against the database."""
     try:
         sql_driver = await get_sql_driver(database)
-        rows = await sql_driver.execute_query(sql)  # type: ignore
-        if rows is None:
+        table = await sql_driver.execute_table(sql, max_rows=output_limits.max_rows)  # type: ignore
+        if table is None:
             return format_text_response("No results")
-        cells = [r.cells for r in rows]
-        if max_result_rows is not None and len(cells) > max_result_rows:
-            return format_text_response(f"{cells[:max_result_rows]}\n(truncated to {max_result_rows} of {len(cells)} rows by --max-rows)")
-        return format_text_response(cells)
+        return format_text_response(render_table(table, output_limits))
     except Exception as e:
         logger.error(f"Error executing query: {e}")
         return format_error_response(str(e))
@@ -635,18 +636,46 @@ async def main():
         type=str,
         default="",
         help=(
-            "Restricted mode only: comma-separated extensions (e.g. postgis,mobilitydb) whose IMMUTABLE/STABLE, "
-            "non-SECURITY-DEFINER functions the query validator accepts. The transaction stays read-only."
+            "Restricted mode only: comma-separated extensions (e.g. postgis,uuid-ossp), or '*' for every installed "
+            "extension the server knows, whose IMMUTABLE/STABLE, non-SECURITY-DEFINER functions and aggregates the "
+            "query validator accepts. The transaction stays read-only."
         ),
     )
+    out_defaults = OutputLimits()
     parser.add_argument(
         "--max-rows",
         type=int,
-        default=None,
+        default=out_defaults.max_rows,
         help=(
-            "Cap the rows execute_sql returns and append a truncation note (default: no cap). "
-            "Rows are still fetched from the server; the cap protects the client's context, not the database."
+            f"Rows execute_sql returns, with a note when more exist (default: {out_defaults.max_rows}; 0 = no cap). "
+            "The server still sends the whole result; the cap bounds conversion and the client's context."
         ),
+    )
+    parser.add_argument(
+        "--max-cell-chars",
+        type=int,
+        default=out_defaults.max_cell_chars,
+        help=f"Characters per text, JSON or bytea cell before it is cut and marked (default: {out_defaults.max_cell_chars}; 0 = no cap)",
+    )
+    parser.add_argument(
+        "--max-result-bytes",
+        type=int,
+        default=out_defaults.max_result_bytes,
+        help=f"Bytes per execute_sql response; rows past it are dropped with a note (default: {out_defaults.max_result_bytes}; 0 = no cap)",
+    )
+    parser.add_argument(
+        "--vector-preview",
+        type=int,
+        default=out_defaults.vector_preview,
+        help=(
+            f"pgvector values longer than N print as {{dims, preview}} with the first N components "
+            f"(default: {out_defaults.vector_preview}; 0 = full vectors). Cast to text (embedding::text) for the full value."
+        ),
+    )
+    parser.add_argument(
+        "--refuse-superuser",
+        action="store_true",
+        help="Restricted mode: refuse to open a database whose login role is a superuser (default: warn and continue)",
     )
     pool_defaults = PoolSettings()
     parser.add_argument(
@@ -714,14 +743,27 @@ async def main():
     args = parser.parse_args()
 
     # Store the access mode in the global variable
-    global current_access_mode, databases, max_result_rows
+    global current_access_mode, databases, output_limits
     current_access_mode = AccessMode(args.access_mode)
-    if args.max_rows is not None and args.max_rows < 1:
-        parser.error("--max-rows must be at least 1")
-    max_result_rows = args.max_rows
-    allowed_extensions = parse_extension_list(args.allow_extension_functions)
+    try:
+        output_limits = OutputLimits(
+            max_rows=args.max_rows or None,
+            max_cell_chars=args.max_cell_chars or None,
+            max_result_bytes=args.max_result_bytes or None,
+            vector_preview=args.vector_preview or None,
+        )
+        allowed_extensions = parse_extension_list(args.allow_extension_functions)
+    except ValueError as e:
+        parser.error(str(e))
     if allowed_extensions and current_access_mode != AccessMode.RESTRICTED:
         logger.warning("--allow-extension-functions has no effect outside restricted mode")
+    superuser_policy: SuperuserPolicy
+    if current_access_mode != AccessMode.RESTRICTED:
+        superuser_policy = "allow"
+    elif args.refuse_superuser:
+        superuser_policy = "refuse"
+    else:
+        superuser_policy = "warn"
 
     # Add the query tool with a description and annotations appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
@@ -756,7 +798,12 @@ async def main():
         databases = DatabaseRegistry(
             pairs,
             default=default_name,
-            settings=PoolSettings(max_size=args.pool_max_size, max_idle=args.pool_max_idle, connect_timeout=args.connect_timeout),
+            settings=PoolSettings(
+                max_size=args.pool_max_size,
+                max_idle=args.pool_max_idle,
+                connect_timeout=args.connect_timeout,
+                superuser=superuser_policy,
+            ),
             budget=PoolBudget(max_open_pools=args.max_open_pools, idle_ttl=args.pool_idle_ttl),
             allowed_extensions=allowed_extensions if current_access_mode == AccessMode.RESTRICTED else (),
         )

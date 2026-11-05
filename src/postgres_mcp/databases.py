@@ -115,6 +115,7 @@ class Database:
                 return
             try:
                 self.extension_functions = await discover_read_only_functions(SqlDriver(conn=self.pool), allowed_extensions)
+                logger.info(f"Database {self.name!r}: {len(self.extension_functions)} extension functions admitted")
             except Exception as e:
                 logger.warning(f"Extension discovery on {self.name!r} failed, will retry: {obfuscate_password(str(e))}")
 

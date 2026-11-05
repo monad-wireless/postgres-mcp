@@ -8,6 +8,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from collections.abc import Awaitable
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -16,13 +17,20 @@ from typing import Dict
 from typing import List
 from typing import Literal
 from typing import Optional
+from typing import TypeVar
 from urllib.parse import urlparse
 from urllib.parse import urlunparse
 
 from psycopg.rows import dict_row
+from psycopg.rows import tuple_row
 from psycopg_pool import AsyncConnectionPool
 from psycopg_pool import PoolTimeout
 from typing_extensions import LiteralString
+
+from .json_output import QueryTable
+from .json_output import ResultColumn
+from .type_adapters import ExtensionTypeCache
+from .type_adapters import configure_connection
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +77,11 @@ def obfuscate_password(text: str | None) -> str | None:
     return text
 
 
+T = TypeVar("T")
 PoolState = Literal["closed", "open", "failed"]
+SuperuserPolicy = Literal["allow", "warn", "refuse"]
+
+_ROLE_PROBE: LiteralString = "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +99,9 @@ class PoolSettings:
     max_lifetime: float = 3600.0
     connect_timeout: float = 10.0
     acquire_timeout: float = 30.0
+    # What to do when the login role is a superuser: the server sets "warn" in restricted mode and
+    # "refuse" with --refuse-superuser; unrestricted mode allows it.
+    superuser: SuperuserPolicy = "allow"
 
     def __post_init__(self) -> None:
         if self.min_size < 0 or self.max_size < 1 or self.min_size > self.max_size:
@@ -206,6 +221,7 @@ class DbConnPool:
         self.budget = budget
         self.pool: AsyncConnectionPool[Any] | None = None
         self.state: PoolState = "closed"
+        self.superuser: bool | None = None  # known after the first successful open
         self.leases = 0
         self.last_used: float = self._now()
         self._last_error: str | None = None
@@ -232,6 +248,11 @@ class DbConnPool:
             raise ValueError(self._last_error)
 
         s = self.settings
+        types = ExtensionTypeCache()  # fresh per pool: an extension may have been (re)installed meanwhile
+
+        async def configure(conn: Any) -> None:
+            await configure_connection(conn, types)
+
         pool: AsyncConnectionPool[Any] = AsyncConnectionPool(
             conninfo=url,
             min_size=s.min_size,
@@ -240,15 +261,20 @@ class DbConnPool:
             max_lifetime=s.max_lifetime,
             timeout=s.acquire_timeout,
             kwargs={"connect_timeout": max(1, round(s.connect_timeout))},
+            configure=configure,
             check=AsyncConnectionPool.check_connection,
             open=False,
         )
         try:
             await pool.open(wait=True, timeout=s.connect_timeout)
             # Probe: with min_size=0 the open succeeds without a connection, so ask for one.
+            # The same round trip reads whether this login is a superuser (see PoolSettings.superuser).
             async with pool.connection(timeout=s.connect_timeout) as conn:
                 async with conn.cursor() as cursor:
-                    await cursor.execute("SELECT 1")
+                    await cursor.execute(_ROLE_PROBE)
+                    row = await cursor.fetchone()
+            self.superuser = row is not None and row[0] is True
+            self._apply_superuser_policy(url)
         except Exception as e:
             self.state = "failed"
             self._last_error = obfuscate_password(str(e))
@@ -262,6 +288,17 @@ class DbConnPool:
         if self.budget is not None:
             await self.budget.admit(self)
         return pool
+
+    def _apply_superuser_policy(self, url: str) -> None:
+        if not self.superuser or self.settings.superuser == "allow":
+            return
+        where = obfuscate_password(url)
+        if self.settings.superuser == "refuse":
+            raise ValueError(f"{where} logs in as a superuser and --refuse-superuser is set; use a read-only role")
+        logger.warning(
+            f"{where} logs in as a superuser. Restricted mode then rests on the query validator and the "
+            "read-only transaction alone; a role with pg_read_all_data is safer."
+        )
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Any]:
@@ -320,6 +357,7 @@ class DbConnPool:
             "in_flight": self.leases,
             "idle_seconds": None if self.leases or self.state != "open" else round(self._now() - self.last_used, 1),
             "last_error": self._last_error,
+            "superuser": self.superuser,
         }
 
 
@@ -383,6 +421,41 @@ class SqlDriver:
         Returns:
             List of RowResult objects or None on error
         """
+
+        async def collect(cursor: Any) -> list[SqlDriver.RowResult]:
+            return [SqlDriver.RowResult(cells=dict(row)) for row in await cursor.fetchall()]
+
+        return await self._run(query, params, force_readonly, dict_row, collect)
+
+    async def execute_table(
+        self,
+        query: LiteralString,
+        params: list[Any] | None = None,
+        force_readonly: bool = False,
+        max_rows: int | None = None,
+    ) -> QueryTable | None:
+        """Run a query and return its last result as columns plus row tuples, for tool output.
+
+        Unlike ``execute_query`` (dict rows, used by the internal tools), duplicate column names are
+        kept, each column carries its type name, and at most ``max_rows`` rows are converted:
+        ``fetchmany(max_rows + 1)`` tells whether more exist without building them. This bounds the
+        Python work and the response, not the transfer: a client-side cursor has already received
+        the whole result from the server. A server-side cursor would bound that too, but ``DECLARE``
+        accepts only one SELECT or VALUES, and this method serves multi-statement input and EXPLAIN.
+        """
+
+        async def collect(cursor: Any) -> QueryTable:
+            columns = [ResultColumn(name=c.name, type=c.type_display) for c in cursor.description]
+            if max_rows is None:
+                return QueryTable(columns, await cursor.fetchall())
+            rows = await cursor.fetchmany(max_rows + 1)
+            return QueryTable(columns, rows[:max_rows], more=len(rows) > max_rows)
+
+        return await self._run(query, params, force_readonly, tuple_row, collect)
+
+    async def _run(
+        self, query: Any, params: list[Any] | None, force_readonly: bool, row_factory: Any, collect: Callable[[Any], Awaitable[T]]
+    ) -> T | None:
         try:
             if self.conn is None:
                 self.connect()
@@ -393,9 +466,13 @@ class SqlDriver:
                 # A lease pins the pool against eviction for the duration of the query. A query
                 # error leaves the pool open: psycopg_pool drops a broken connection at checkout.
                 async with self.conn.connection() as connection:
-                    return await self._execute_with_connection(connection, query, params, force_readonly=force_readonly)
+                    return await self._run_on_connection(
+                        connection, query, params, force_readonly=force_readonly, row_factory=row_factory, collect=collect
+                    )
             else:
-                return await self._execute_with_connection(self.conn, query, params, force_readonly=force_readonly)
+                return await self._run_on_connection(
+                    self.conn, query, params, force_readonly=force_readonly, row_factory=row_factory, collect=collect
+                )
         except Exception:
             if self.conn and not self.is_pool:
                 self.conn = None
@@ -403,9 +480,19 @@ class SqlDriver:
 
     async def _execute_with_connection(self, connection, query, params, force_readonly) -> Optional[List[RowResult]]:
         """Execute query with the given connection."""
+
+        async def collect(cursor: Any) -> list[SqlDriver.RowResult]:
+            return [SqlDriver.RowResult(cells=dict(row)) for row in await cursor.fetchall()]
+
+        return await self._run_on_connection(connection, query, params, force_readonly, dict_row, collect)
+
+    async def _run_on_connection(
+        self, connection: Any, query: Any, params: list[Any] | None, force_readonly: bool, row_factory: Any, collect: Callable[[Any], Awaitable[T]]
+    ) -> T | None:
+        """Run ``query`` in one transaction (read-only when forced); ``collect`` reads the last result."""
         transaction_started = False
         try:
-            async with connection.cursor(row_factory=dict_row) as cursor:
+            async with connection.cursor(row_factory=row_factory) as cursor:
                 # Start read-only transaction
                 if force_readonly:
                     await cursor.execute("BEGIN TRANSACTION READ ONLY")
@@ -428,8 +515,8 @@ class SqlDriver:
                         transaction_started = False
                     return None
 
-                # Get results from the last statement only
-                rows = await cursor.fetchall()
+                # Read the last statement's result before COMMIT/ROLLBACK replaces it
+                result = await collect(cursor)
 
                 # End the transaction appropriately
                 if not force_readonly:
@@ -438,7 +525,7 @@ class SqlDriver:
                     await cursor.execute("ROLLBACK")
                     transaction_started = False
 
-                return [SqlDriver.RowResult(cells=dict(row)) for row in rows]
+                return result
 
         except Exception as e:
             # Try to roll back the transaction if it's still active

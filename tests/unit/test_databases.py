@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -95,6 +96,7 @@ def test_describe_has_location_and_no_credentials():
         "in_flight": 0,
         "idle_seconds": None,
         "last_error": None,
+        "superuser": None,
         "extension_functions": None,
     }
     assert described[1]["default"] is False
@@ -224,7 +226,7 @@ async def test_list_databases_tool():
     with patch("postgres_mcp.server.databases", DatabaseRegistry([("gis", GIS), ("lake", LAKE)])):
         out = await server.list_databases()
     text = _text(out)
-    assert "'name': 'gis'" in text and "'name': 'lake'" in text
+    assert [db["name"] for db in json.loads(text)] == ["gis", "lake"]
     assert "secret" not in text
 
 
