@@ -40,6 +40,23 @@ Postgres MCP Pro supports both the [Standard Input/Output (stdio)](https://model
 
 For additional background on why we built Postgres MCP Pro, see [our launch blog post](https://www.crystaldba.ai/blog/post/announcing-postgres-mcp-server-pro).
 
+### About this fork
+
+This is the [monad-wireless](https://github.com/monad-wireless/postgres-mcp) fork of [crystaldba/postgres-mcp](https://github.com/crystaldba/postgres-mcp). It adds the following to the upstream server:
+
+| Area | What the fork adds | Section |
+|---|---|---|
+| Extensions in restricted mode | Read-only functions and aggregates of named extensions (or `*`) are admitted, discovered per database | [Extension functions](#extension-functions-in-restricted-mode-optional) |
+| Several databases | One server, named databases, a `database` argument on every tool | [Several databases](#several-databases-optional) |
+| Connection pools | Pools open on first use, idle connections close, a cap on open pools with least-recently-used eviction | [Connection pools](#connection-pools-optional) |
+| Result format | `execute_sql` returns JSON with typed columns; every tool returns JSON, not Python literals | [Result format and size](#result-format-and-size-optional) |
+| Types | Infinite dates and timestamps, intervals as text, `hstore` as an object, pgvector values | [Result format and size](#result-format-and-size-optional) |
+| Output bounds | Caps on rows, characters per cell and bytes per response, on by default | [Result format and size](#result-format-and-size-optional) |
+| Validator | Functions in `FROM` are checked; rejections name the reason | [Protected SQL Execution](#protected-sql-execution) |
+| Superuser logins | Reported in `list_databases`, warned in restricted mode, refused on request | [Extension functions](#extension-functions-in-restricted-mode-optional) |
+
+The fork is not on PyPI or Docker Hub. Run it from GitHub with `uvx` (see [Running the fork](#running-the-fork)). Every option is listed in [Command-line options](#command-line-options).
+
 ## Demo
 
 *From Unusable to Lightning Fast*
@@ -306,6 +323,69 @@ Each database has its own pool, and a pool opens only when a tool call needs it.
 
 A pool with a query in flight never closes. If every open pool is busy, a new pool opens beyond `--max-open-pools` and the server logs a warning. Outside that case the server holds at most `max-open-pools × pool-max-size` connections. A query error leaves its pool open: psycopg_pool checks each connection at checkout and replaces a broken one.
 
+Each new connection also gets the type loaders described in [Result format and size](#result-format-and-size-optional). The extension types of a database are looked up once per pool, not once per connection.
+
+##### Running the fork
+
+`uvx` installs the fork from GitHub, so a machine needs no checkout. `--refresh-package` makes `uvx` fetch the head of `main` again at each start, so a push takes effect at the next MCP restart. Keep the passwords in the environment (`DATABASE_URI_<NAME>`), not in the arguments.
+
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "uvx",
+      "args": [
+        "--refresh-package", "postgres-mcp",
+        "--with", "mcp<2",
+        "--from", "git+https://github.com/monad-wireless/postgres-mcp@main",
+        "postgres-mcp",
+        "--access-mode=restricted",
+        "--allow-extension-functions=postgis,mobilitydb",
+        "--default-database=gis",
+        "--max-rows=500",
+        "--max-cell-chars=2000",
+        "--max-result-bytes=262144",
+        "--vector-preview=8",
+        "--pool-max-size=5",
+        "--pool-max-idle=300",
+        "--connect-timeout=10",
+        "--max-open-pools=8",
+        "--pool-idle-ttl=900"
+      ],
+      "env": {
+        "DATABASE_URI_GIS": "postgresql://user:password@host:5432/monad_gis",
+        "DATABASE_URI_LAKE": "postgresql://user:password@host:5432/monad_lake"
+      }
+    }
+  }
+}
+```
+
+The server stops at startup if an argument is unknown to the version it runs. So add a new option to a client configuration only after the commit that adds it is on `main`.
+
+##### Command-line options
+
+| Option | Default | Effect |
+|---|---|---|
+| `database_url` (positional) | none | One database, registered as `default`. `DATABASE_URI` overrides it. |
+| `--database NAME=URI` | none | Adds a named database. Repeatable. `DATABASE_URI_<NAME>` adds more. |
+| `--default-database NAME` | first registered | Database used when a tool call names none. |
+| `--access-mode` | `unrestricted` | `restricted` forces read-only transactions, validates every statement and limits execution to 30 s. |
+| `--allow-extension-functions` | none | Restricted mode: extensions whose read-only functions and aggregates are admitted, or `*`. |
+| `--refuse-superuser` | off | Restricted mode: a database whose login role is a superuser fails to open. Without it the server warns. |
+| `--max-rows N` | 500 | Rows `execute_sql` returns. `0` = no cap. |
+| `--max-cell-chars N` | 2000 | Characters per text, JSON or `bytea` cell. `0` = no cap. |
+| `--max-result-bytes N` | 262144 | Bytes per `execute_sql` response. `0` = no cap. |
+| `--vector-preview N` | 8 | pgvector components printed before a summary. `0` = full vectors. |
+| `--pool-max-size N` | 5 | Connections per database pool. |
+| `--pool-max-idle S` | 300 | Seconds before an idle connection closes. |
+| `--connect-timeout S` | 10 | Seconds to open a pool and get its first connection. |
+| `--max-open-pools N` | 8 | Open pools kept at once. |
+| `--pool-idle-ttl S` | 900 | Seconds an unused pool stays open. |
+| `--transport` | `stdio` | `stdio`, `sse` or `streamable-http`. |
+| `--sse-host`, `--sse-port` | `localhost`, 8000 | Bind address for `sse`. |
+| `--streamable-http-host`, `--streamable-http-port` | `localhost`, 8000 | Bind address for `streamable-http`. |
+
 
 #### Other MCP Clients
 
@@ -420,11 +500,11 @@ Postgres MCP Pro Tools:
 
 | Tool Name | Description |
 |-----------|-------------|
-| `list_databases` | Lists the configured databases (name, host, port, dbname, connection state, default flag). Every other tool takes an optional `database` argument naming one of them. |
+| `list_databases` | Lists the configured databases: name, default flag, host, port, dbname, pool state, queries in flight, idle seconds, last error, whether the login is a superuser, and the number of admitted extension functions. No credentials. Every other tool takes an optional `database` argument naming one of them. |
 | `list_schemas` | Lists all database schemas available in the PostgreSQL instance. |
 | `list_objects` | Lists database objects (tables, views, sequences, extensions) within a specified schema. |
 | `get_object_details` | Provides information about a specific database object, for example, a table's columns, constraints, and indexes. |
-| `execute_sql` | Executes SQL statements on the database, with read-only limitations when connected in restricted mode. |
+| `execute_sql` | Executes SQL statements on the database, with read-only limitations when connected in restricted mode. Returns JSON `{"columns", "rows", "row_count", "note"}` for the last statement, within the output bounds. |
 | `explain_query` | Gets the execution plan for a SQL query describing how PostgreSQL will process it and exposing the query planner's cost model. Can be invoked with hypothetical indexes to simulate the behavior after adding indexes. |
 | `get_top_queries` | Reports the slowest SQL queries based on total execution time using `pg_stat_statements` data. |
 | `analyze_workload_indexes` | Analyzes the database workload to identify resource-intensive queries, then recommends optimal indexes for them. |
@@ -487,6 +567,7 @@ We are building out a suite of AI-generated adversarial workloads designed to ch
 *What Postgres versions are supported?*
 Our testing presently focuses on Postgres 15, 16, and 17.
 We plan to support Postgres versions 13 through 17.
+The fork's test suite runs against Docker images of PostgreSQL 12, 15 and 16. `int4multirange` needs 14 or later, and core `gen_random_uuid()` needs 13 or later.
 
 *Who created this project?*
 This project is created and maintained by [Crystal DBA](https://www.crystaldba.ai).
@@ -700,6 +781,34 @@ We designed restricted mode to be conservative, erring on the side of safety eve
 Restricted mode is limited to read-only operations, and we limit query execution time to prevent long-running queries from impacting system performance.
 We may add measures in the future to make sure that restricted mode is safe to use with production databases.
 
+#### A read-only login role
+
+A dedicated role makes the database itself refuse writes, independent of this server. Create it as a superuser:
+
+```sql
+CREATE ROLE mcp_ro LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 10;
+ALTER ROLE mcp_ro PASSWORD 'secret';                    -- double every ' in the password
+ALTER ROLE mcp_ro SET default_transaction_read_only = on;
+GRANT pg_read_all_data, pg_read_all_stats TO mcp_ro;    -- PostgreSQL 14 or later
+```
+
+Then point every `DATABASE_URI_<NAME>` at `mcp_ro` and add `--refuse-superuser`, so that a URL still using a superuser fails to open.
+Checked on PostgreSQL 16 with hypopg 1.4.5 and `pg_stat_statements` preloaded, logged in as this role in restricted mode:
+
+- `list_databases` shows `"superuser": false`. The value is `null` until the database has opened once, so query each database before you read it.
+- `current_setting('default_transaction_read_only')` is `on`. `pg_read_all_data` lets `SELECT` read every table.
+- `get_top_queries` ranks queries of all roles, including their text (`pg_read_all_stats`).
+- `explain_query` with a hypothetical index switches the plan from a sequential scan to an index scan. hypopg works under the read-only setting.
+- `hypopg_list_indexes` is a view in hypopg 1.4: `SELECT * FROM hypopg_list_indexes`, not `hypopg_list_indexes()`. The hypopg functions are on the core list and need no `--allow-extension-functions`.
+
+Two traps:
+
+- **Password quoting.** If a script sets the password through psql's `\set pw '…'`, psql reads backslash escapes inside the quotes, so `ab\tcd` is stored as `ab<TAB>cd` and the login fails. Put the password in plain SQL instead (`PASSWORD '…'` with every `'` doubled). With `standard_conforming_strings = on`, the default, backslashes stay literal. Either way, the password reaches the server as statement text, so statement or audit logging can record it.
+- **Connection limit.** `CONNECTION LIMIT` counts all databases together for that role, but `--max-open-pools` caps pools, not connections. Up to `max-open-pools × pool-max-size` connections can be open (8 × 5 = 40 by default). Keep that product under the role's limit, for example `--pool-max-size=1` for eight databases against a limit of 10. A connection over the limit fails with "too many connections for role".
+
+In this fork, restricted mode has two layers. The validator checks every statement and every function call. Below it, each query runs in a `BEGIN TRANSACTION READ ONLY` transaction that is rolled back afterwards. A test on PostgreSQL 12, 15 and 16 checks that `transaction_read_only` is `on` inside that transaction (`tests/unit/sql/test_live_types.py`).
+Both layers act with the login role's privileges. If that role is a superuser, a gap in the validator would run with superuser rights, so the server reports it (see `--refuse-superuser`). A third layer is a login role with `pg_read_all_data` and `pg_read_all_stats` and no write grants.
+
 
 ## Postgres MCP Pro Development
 
@@ -731,3 +840,16 @@ The instructions below are for developers who want to work on Postgres MCP Pro, 
    ```bash
    uv run postgres-mcp "postgres://user:password@localhost:5432/dbname"
    ```
+
+### Checks before a push
+
+These are the commands that `.github/workflows/build.yml` runs. The tests start PostgreSQL containers, so Docker must be running.
+
+```bash
+uv run ruff format --check .
+uv run ruff check .
+uv run pyright
+uv run pytest
+```
+
+The ruff target is still Python 3.9 (`pyproject.toml`), so ruff rejects `match` statements even though the runtime needs 3.12. `tests/unit/sql/test_live_types.py` holds the acceptance tests for result types and extensions. pgvector is not in the test images, so its loaders are tested on their text form only.

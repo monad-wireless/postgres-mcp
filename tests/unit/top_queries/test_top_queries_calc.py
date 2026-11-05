@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -122,6 +123,8 @@ async def test_top_queries_pg12_total_sort(mock_pg12_driver, mock_extension_inst
     assert "Top 3 slowest queries by total execution time" in result
     # First query should be the one with highest total_time
     assert "SELECT * FROM users" in result
+    # The rows after the heading are JSON, not a Python repr
+    assert isinstance(json.loads(result.split("\n", 1)[1]), list)
     # Verify the query used the correct column name for PG 12
     assert "total_time" in str(mock_pg12_driver.execute_query.call_args)
     assert "ORDER BY total_time DESC" in str(mock_pg12_driver.execute_query.call_args)
@@ -222,6 +225,7 @@ async def test_resource_queries_pg12(mock_pg12_driver, mock_extension_installed)
 
     # Get resource queries
     _result = await calc.get_top_resource_queries(frac_threshold=0.05)
+    assert isinstance(json.loads(_result), list)
 
     # Get the executed query from the mock
     call_args = str(mock_pg12_driver.execute_query.call_args)
