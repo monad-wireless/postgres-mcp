@@ -13,10 +13,21 @@ It changes three things relative to psycopg's defaults:
 3. **Extension types, when the extension is installed in that database.** ``hstore`` loads as a
    ``dict`` (psycopg's own adapter); pgvector's ``vector`` and ``halfvec`` load as ``Vector`` and
    ``sparsevec`` as ``SparseVector``, parsed from their text form, so no pgvector client library is
-   needed. Other extension types (``citext``, ``ltree``) already load as ``str``.
+   needed. Apache AGE's ``agtype`` loads through ``agtype.parse_agtype`` (vertices, edges and
+   paths as dataclasses, ``::numeric`` as ``Decimal``). Other extension types (``citext``,
+   ``ltree``) already load as ``str``.
+4. **Apache AGE session setup, when ``agtype`` exists.** ``prepare_age_session`` runs
+   ``LOAD 'age'`` (then ``LOAD '$libdir/plugins/age'``) and appends ``ag_catalog`` to
+   ``search_path``. Probes on AGE 1.8.0 showed why: without ``shared_preload_libraries=age`` the
+   first ``cypher()`` call of a session fails ("unhandled cypher(cstring) function call") unless
+   the library was loaded; without ``ag_catalog`` on the path, ``create_graph`` and Cypher
+   comparisons (``WHERE n.age = 30``) fail. A non-superuser may not ``LOAD 'age'`` even when it
+   is preloaded, so a refused ``LOAD`` is normal and only logged. ``ag_catalog`` goes last, so
+   the caller's own schemas still win every name lookup.
 
 The extension lookup is one catalogue query per pool, cached on the pool, so a connection that
-psycopg_pool recycles after ``max_idle`` does not repeat it.
+psycopg_pool recycles after ``max_idle`` does not repeat it. The pool also remembers which
+``LOAD`` form worked, so a refused one is tried once per pool, not once per connection.
 """
 
 from __future__ import annotations
@@ -37,10 +48,24 @@ from psycopg.types.datetime import TimestampLoader
 from psycopg.types.datetime import TimestamptzBinaryLoader
 from psycopg.types.datetime import TimestamptzLoader
 from psycopg.types.hstore import register_hstore
+from typing_extensions import LiteralString
+
+from .agtype import AgtypeSyntaxError
+from .agtype import parse_agtype
 
 logger = logging.getLogger(__name__)
 
-EXTENSION_TYPES: tuple[str, ...] = ("hstore", "vector", "halfvec", "sparsevec")
+EXTENSION_TYPES: tuple[str, ...] = ("hstore", "vector", "halfvec", "sparsevec", "agtype")
+
+AGE_LOAD_STATEMENTS: tuple[LiteralString, ...] = ()
+AGE_SEARCH_PATH: LiteralString = """
+SELECT pg_catalog.set_config(
+    'search_path',
+    CASE WHEN pg_catalog.current_setting('search_path') = '' THEN 'ag_catalog'
+         ELSE pg_catalog.current_setting('search_path') || ', ag_catalog' END,
+    false)
+WHERE 'ag_catalog' <> ALL (pg_catalog.current_schemas(false))
+"""
 
 _EXTENSION_TYPE_QUERY = """
 SELECT t.typname, t.oid::int, t.typarray::int
@@ -129,6 +154,16 @@ class _SparseVectorLoader(Loader):
         return SparseVector.parse(bytes(data).decode())
 
 
+class _AgtypeLoader(Loader):
+    def load(self, data: Any) -> Any:
+        text = bytes(data).decode()
+        try:
+            return parse_agtype(text)
+        except AgtypeSyntaxError as e:
+            logger.debug(f"agtype value kept as text ({e}): {text[:200]}")
+            return text
+
+
 def register_core_loaders(conn: AsyncConnection[Any]) -> None:
     """Infinity-safe date/timestamp loaders and verbatim intervals (no query, no transaction)."""
     adapters = conn.adapters
@@ -147,6 +182,8 @@ class ExtensionTypeCache:
 
     def __init__(self) -> None:
         self.types: dict[str, TypeInfo] | None = None
+        # AGE: candidate LOAD statements still worth trying in this pool; narrowed to the one that worked.
+        self.age_loads: tuple[LiteralString, ...] = AGE_LOAD_STATEMENTS
 
     async def fetch(self, conn: AsyncConnection[Any]) -> dict[str, TypeInfo]:
         if self.types is None:
@@ -162,19 +199,50 @@ class ExtensionTypeCache:
 def register_extension_loaders(conn: AsyncConnection[Any], types: dict[str, TypeInfo]) -> None:
     if (info := types.get("hstore")) is not None:
         register_hstore(info, conn)
-    for name, loader in (("vector", _VectorLoader), ("halfvec", _VectorLoader), ("sparsevec", _SparseVectorLoader)):
+    for name, loader in (("vector", _VectorLoader), ("halfvec", _VectorLoader), ("sparsevec", _SparseVectorLoader), ("agtype", _AgtypeLoader)):
         if (info := types.get(name)) is not None:
             info.register(conn)  # so column type names resolve ("vector", not the OID)
             conn.adapters.register_loader(info.oid, loader)
+
+
+async def prepare_age_session(conn: AsyncConnection[Any], cache: ExtensionTypeCache) -> None:
+    """Load the AGE library if this role may, then append ``ag_catalog`` to ``search_path`` (committed)."""
+    for statement in cache.age_loads:
+        try:
+            await conn.execute(statement)
+            await conn.commit()
+            cache.age_loads = (statement,)
+            break
+        except Exception as e:
+            await conn.rollback()
+            logger.debug(f"{statement} refused: {e}")
+    else:
+        if cache.age_loads:
+            logger.info(
+                "This role may not LOAD the AGE library; cypher() works when age is in shared_preload_libraries "
+                "or session_preload_libraries, otherwise the first call of each session fails"
+            )
+        cache.age_loads = ()
+    # set_config(..., false) is session-wide but transactional: the commit keeps it past configure's rollback.
+    await conn.execute(AGE_SEARCH_PATH)
+    await conn.commit()
 
 
 async def configure_connection(conn: AsyncConnection[Any], cache: ExtensionTypeCache) -> None:
     """psycopg_pool ``configure=`` body: leaves the connection idle, as the pool requires."""
     register_core_loaders(conn)
     try:
-        register_extension_loaders(conn, await cache.fetch(conn))
+        types = await cache.fetch(conn)
+        register_extension_loaders(conn, types)
     except Exception as e:
         # A failed lookup must not cost the connection: extension values then load as text.
         logger.warning(f"Extension type lookup failed; those values stay text: {e}")
+        types = {}
+    if "agtype" in types:
+        try:
+            await prepare_age_session(conn, cache)
+        except Exception as e:
+            logger.warning(f"AGE session setup failed; cypher() may need ag_catalog qualified names: {e}")
+            await conn.rollback()
     if conn.info.transaction_status != pq.TransactionStatus.IDLE:
         await conn.rollback()

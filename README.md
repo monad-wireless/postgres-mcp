@@ -54,6 +54,7 @@ This is the [monad-wireless](https://github.com/monad-wireless/postgres-mcp) for
 | Output bounds | Caps on rows, characters per cell and bytes per response, on by default | [Result format and size](#result-format-and-size-optional) |
 | Validator | Functions in `FROM` are checked; rejections name the reason | [Protected SQL Execution](#protected-sql-execution) |
 | Superuser logins | Reported in `list_databases`, warned in restricted mode, refused on request | [Extension functions](#extension-functions-in-restricted-mode-optional) |
+| Apache AGE graphs | `execute_cypher`, `list_graphs`, `get_graph_schema`; `agtype` decoded; session setup; read-only Cypher in restricted mode | [Apache AGE graphs](#apache-age-graphs-optional) |
 
 The fork is not on PyPI or Docker Hub. Run it from GitHub with `uvx` (see [Running the fork](#running-the-fork)). Every option is listed in [Command-line options](#command-line-options).
 
@@ -284,6 +285,33 @@ pgvector values longer than `--vector-preview` components print as `{"dims": 768
 
 `0` disables any of the four. The other tools also return JSON instead of Python literals.
 
+##### Apache AGE graphs (optional)
+
+When a database has the [Apache AGE](https://age.apache.org/) extension, three tools work on its graphs (the facts below were checked on AGE 1.8.0 with PostgreSQL 18):
+
+| Tool | What it does |
+|---|---|
+| `execute_cypher` | Runs Cypher. You pass `graph`, `query`, one name per returned value in `columns`, and optional `params` (a JSON object, read in Cypher as `$key`). The server writes `SELECT * FROM ag_catalog.cypher(...) AS (...)`. |
+| `list_graphs` | Graphs with their schema and the number of vertex and edge labels. |
+| `get_graph_schema` | Labels with planner row estimates, property keys and value types, and the vertex labels each edge label connects. Keys, types and endpoints come from a sample of `sample_size` rows per label (default 100). |
+
+`agtype` values decode in every tool, `execute_sql` included. A vertex is `{"kind": "vertex", "id", "label", "properties"}`, an edge also has `start_id` and `end_id`, and a path is `{"kind": "path", "elements": [...]}`. `::numeric` values become strings, as other `numeric` values do.
+
+Each new connection to a database with AGE does two things:
+
+1. It runs `LOAD 'age'`, then `LOAD '$libdir/plugins/age'`. Without this, the first `cypher()` call of a session fails ("unhandled cypher(cstring) function call") unless the server preloads AGE. A non-superuser may not `LOAD` the library, even when it is preloaded. A refused `LOAD` is logged once per pool and is not an error.
+2. It appends `ag_catalog` to `search_path`. AGE needs it for `create_graph` and for comparisons in Cypher (`WHERE n.age = 30`). It goes last, so your own schemas still win name lookups.
+
+A read-only login needs `USAGE` on `ag_catalog` and on each graph's schema, and `SELECT` on their tables. If it cannot `LOAD` the library, the server must have `age` in `shared_preload_libraries` (or `session_preload_libraries`).
+
+Restricted mode refuses `cypher()` unless AGE is admitted with `--allow-extension-functions=age` (or `*`). With AGE admitted, `cypher()` must take its graph name and query as string constants. A Cypher guard then checks the query:
+
+- It refuses the clauses `CREATE`, `MERGE`, `SET`, `DELETE`, `DETACH`, `REMOVE`, `CALL`, `LOAD`, `FOREACH` and `ANALYZE`.
+- It refuses schema-qualified function calls (`pg_catalog.pg_backend_pid()` runs in Cypher otherwise).
+- It refuses a bare function name unless AGE implements it (`age_<name>` is an admitted function, or the name is `count`, `coalesce`, `any`, `all`, `none`, `single`, `reduce` or `rand`). Cypher resolves any other bare name through `search_path`, so a user's VOLATILE SQL function would run.
+
+The forced read-only transaction is a second barrier. AGE's writes fail in it with "cannot execute CREATE TABLE in a read-only transaction" or "cannot execute SELECT in a read-only transaction". A map key that is also a write keyword (`{set: 1}`) is refused. Quote it with backticks (`` {`set`: 1} ``) to pass. `age_prepare_cypher` and `age_delete_global_graphs` are never admitted, although AGE marks them STABLE: the first stores a query that `cypher(NULL, NULL)` runs out of sight of the guard.
+
 ##### Several databases (optional)
 
 One server can serve several databases, each under a short name:
@@ -500,11 +528,14 @@ Postgres MCP Pro Tools:
 
 | Tool Name | Description |
 |-----------|-------------|
-| `list_databases` | Lists the configured databases: name, default flag, host, port, dbname, pool state, queries in flight, idle seconds, last error, whether the login is a superuser, and the number of admitted extension functions. No credentials. Every other tool takes an optional `database` argument naming one of them. |
+| `list_databases` | Lists the configured databases: name, default flag, host, port, dbname, pool state, queries in flight, idle seconds, last error, whether the login is a superuser, the number of admitted extension functions, and whether restricted mode admits `cypher()`. No credentials. Every other tool takes an optional `database` argument naming one of them. |
 | `list_schemas` | Lists all database schemas available in the PostgreSQL instance. |
 | `list_objects` | Lists database objects (tables, views, sequences, extensions) within a specified schema. |
 | `get_object_details` | Provides information about a specific database object, for example, a table's columns, constraints, and indexes. |
 | `execute_sql` | Executes SQL statements on the database, with read-only limitations when connected in restricted mode. Returns JSON `{"columns", "rows", "row_count", "note"}` for the last statement, within the output bounds. |
+| `execute_cypher` | Runs a Cypher query on an Apache AGE graph. Takes the graph, the query, the names of the returned columns and optional parameters, and returns the same JSON as `execute_sql`. Read-only Cypher only in restricted mode. See [Apache AGE graphs](#apache-age-graphs-optional). |
+| `list_graphs` | Lists the Apache AGE graphs with their schema and label counts. |
+| `get_graph_schema` | Describes one AGE graph: labels, estimated rows, sampled property keys and types, edge endpoints. |
 | `explain_query` | Gets the execution plan for a SQL query describing how PostgreSQL will process it and exposing the query planner's cost model. Can be invoked with hypothetical indexes to simulate the behavior after adding indexes. |
 | `get_top_queries` | Reports the slowest SQL queries based on total execution time using `pg_stat_statements` data. |
 | `analyze_workload_indexes` | Analyzes the database workload to identify resource-intensive queries, then recommends optimal indexes for them. |

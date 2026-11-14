@@ -19,6 +19,9 @@ Python value                   JSON
 ``tuple`` (a record)           list
 ``Vector``                     list of floats, or ``{"dims", "preview"}`` past ``vector_preview``
 ``SparseVector``               ``{"dim", "indices", "values"}``
+``GraphVertex`` (AGE)          ``{"kind": "vertex", "id", "label", "properties"}``
+``GraphEdge`` (AGE)            ``{"kind": "edge", "id", "label", "start_id", "end_id", "properties"}``
+``GraphPath`` (AGE)            ``{"kind": "path", "elements": [vertex, edge, vertex, ...]}``
 anything else                  ``str(value)``; encoding never raises
 =============================  =================================================================
 
@@ -43,6 +46,9 @@ from typing import Any
 from psycopg.types.multirange import Multirange
 from psycopg.types.range import Range
 
+from .agtype import GraphEdge
+from .agtype import GraphPath
+from .agtype import GraphVertex
 from .type_adapters import SparseVector
 from .type_adapters import Vector
 
@@ -113,6 +119,19 @@ def to_jsonable(value: Any, vector_preview: int | None = None) -> Any:
         return _vector(value.values, vector_preview)
     if isinstance(value, SparseVector):
         return {"dim": value.dim, "indices": list(value.indices), "values": [_float(v) for v in value.values]}
+    if isinstance(value, GraphVertex):
+        return {"kind": "vertex", "id": value.id, "label": value.label, "properties": to_jsonable(value.properties, vector_preview)}
+    if isinstance(value, GraphEdge):
+        return {
+            "kind": "edge",
+            "id": value.id,
+            "label": value.label,
+            "start_id": value.start_id,
+            "end_id": value.end_id,
+            "properties": to_jsonable(value.properties, vector_preview),
+        }
+    if isinstance(value, GraphPath):
+        return {"kind": "path", "elements": [to_jsonable(e, vector_preview) for e in value.elements]}
     if isinstance(value, Range):
         return {
             "lower": to_jsonable(value.lower, vector_preview),

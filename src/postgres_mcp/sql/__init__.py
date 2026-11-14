@@ -3,6 +3,9 @@
 from .bind_params import ColumnCollector
 from .bind_params import SqlBindParams
 from .bind_params import TableAliasVisitor
+from .cypher_guard import CypherGuard
+from .extension_functions import ExtensionAllowlist
+from .extension_functions import discover_allowlist
 from .extension_functions import discover_read_only_functions
 from .extension_functions import parse_extension_list
 from .extension_utils import check_extension
@@ -20,7 +23,9 @@ from .sql_driver import obfuscate_password
 
 __all__ = [
     "ColumnCollector",
+    "CypherGuard",
     "DbConnPool",
+    "ExtensionAllowlist",
     "IndexDefinition",
     "PoolBudget",
     "PoolSettings",
@@ -31,6 +36,7 @@ __all__ = [
     "check_extension",
     "check_hypopg_installation_status",
     "check_postgres_version_requirement",
+    "discover_allowlist",
     "discover_read_only_functions",
     "get_postgres_version",
     "obfuscate_password",

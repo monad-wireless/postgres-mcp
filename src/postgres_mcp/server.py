@@ -28,9 +28,15 @@ from .databases import DatabaseRegistry
 from .databases import collect_database_urls
 from .databases import validate_name
 from .explain import ExplainPlanTool
+from .graph import AGE_MISSING
+from .graph import age_version
+from .graph import build_cypher_statement
+from .graph import graph_schema
+from .graph import list_graphs as list_age_graphs
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
+from .sql import CypherGuard
 from .sql import PoolBudget
 from .sql import PoolSettings
 from .sql import SafeSqlDriver
@@ -86,7 +92,8 @@ async def get_sql_driver(database: str | None = None) -> Union[SqlDriver, SafeSq
     if current_access_mode == AccessMode.RESTRICTED:
         logger.debug(f"Using SafeSqlDriver with restrictions (RESTRICTED mode) on database {db.name!r}")
         extra = db.extension_functions or frozenset()
-        return SafeSqlDriver(sql_driver=base_driver, timeout=30, extra_functions=extra)  # 30 second timeout
+        guard = CypherGuard(extra) if db.cypher else None
+        return SafeSqlDriver(sql_driver=base_driver, timeout=30, extra_functions=extra, cypher_guard=guard)  # 30 second timeout
     else:
         logger.debug("Using unrestricted SqlDriver (UNRESTRICTED mode)")
         return base_driver
@@ -466,6 +473,102 @@ async def execute_sql(
         return format_error_response(str(e))
 
 
+CYPHER_DESCRIPTION = (
+    "Run a Cypher query on an Apache AGE graph. Pass the graph name, the query, and one column name per RETURNed value; "
+    "the server writes the SQL wrapper (SELECT * FROM cypher(...) AS (...)). Vertices, edges and paths come back as "
+    "JSON objects tagged with kind."
+)
+
+
+# Registered in main() with a description and annotations that match the access mode, like execute_sql.
+async def execute_cypher(
+    graph: str = Field(description="Name of the Apache AGE graph (call list_graphs to see them)"),
+    query: str = Field(description="Cypher query, e.g. MATCH (p:Person)-[:KNOWS]->(q) RETURN p.name, q.name"),
+    columns: list[str] = Field(
+        description="One name per value the query RETURNs, in order (e.g. ['p_name', 'q_name']). "
+        "The count must match the RETURN clause; a query without RETURN still needs one name.",
+        default=["result"],
+    ),
+    params: dict[str, Any] | None = Field(
+        description="Optional parameters as a JSON object; the query reads each key as $key (e.g. {'name': 'Ann'} for $name).",
+        default=None,
+    ),
+    database: DatabaseName = None,
+) -> ResponseType:
+    """Run Cypher on an AGE graph; vertices, edges and paths come back as tagged JSON objects."""
+    try:
+        statement = build_cypher_statement(graph, query, columns, params)
+        sql_driver = await get_sql_driver(database)
+        if await age_version(sql_driver) is None:
+            return format_error_response(AGE_MISSING)
+        if not statement.params:
+            table = await sql_driver.execute_table(statement.sql, max_rows=output_limits.max_rows)  # type: ignore[arg-type]
+        elif isinstance(sql_driver, SafeSqlDriver):
+            table = await sql_driver.execute_bound_table(
+                statement.sql,  # type: ignore[arg-type]
+                statement.params,
+                validate_as=statement.validate_as,
+                max_rows=output_limits.max_rows,
+            )
+        else:
+            table = await sql_driver.execute_table(statement.sql, params=statement.params, max_rows=output_limits.max_rows)  # type: ignore[arg-type]
+        if table is None:
+            return format_text_response("No results")
+        return format_text_response(render_table(table, output_limits))
+    except Exception as e:
+        logger.error(f"Error executing Cypher: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(
+    description="List the Apache AGE graphs in the database with their schema and label counts.",
+    annotations=ToolAnnotations(
+        title="List Graphs",
+        readOnlyHint=True,
+    ),
+)
+async def list_graphs(database: DatabaseName = None) -> ResponseType:
+    """List AGE graphs (name, schema, vertex and edge label counts)."""
+    try:
+        sql_driver = await get_sql_driver(database)
+        if await age_version(sql_driver) is None:
+            return format_error_response(AGE_MISSING)
+        return format_text_response(await list_age_graphs(sql_driver))
+    except Exception as e:
+        logger.error(f"Error listing graphs: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(
+    description="Describe an Apache AGE graph: vertex and edge labels with estimated row counts (planner statistics), "
+    "property keys and value types, and which vertex labels each edge label connects. Keys, types and endpoints "
+    "come from a sample of rows per label, so rare ones can be missing.",
+    annotations=ToolAnnotations(
+        title="Get Graph Schema",
+        readOnlyHint=True,
+    ),
+)
+async def get_graph_schema(
+    graph: str = Field(description="Name of the AGE graph"),
+    sample_size: int = Field(description="Rows sampled per label for property keys and endpoints (1-10000)", default=100),
+    database: DatabaseName = None,
+) -> ResponseType:
+    """Labels, estimated sizes, sampled property keys and edge endpoints of one AGE graph."""
+    if not 1 <= sample_size <= 10000:
+        return format_error_response("sample_size must be between 1 and 10000")
+    try:
+        sql_driver = await get_sql_driver(database)
+        if await age_version(sql_driver) is None:
+            return format_error_response(AGE_MISSING)
+        schema = await graph_schema(sql_driver, graph, sample_size)
+        if schema is None:
+            return format_error_response(f"Graph {graph!r} does not exist (call list_graphs to see them)")
+        return format_text_response(schema)
+    except Exception as e:
+        logger.error(f"Error describing graph: {e}")
+        return format_error_response(str(e))
+
+
 @mcp.tool(
     description="Analyze frequently executed queries in the database and recommend optimal indexes",
     annotations=ToolAnnotations(
@@ -638,7 +741,8 @@ async def main():
         help=(
             "Restricted mode only: comma-separated extensions (e.g. postgis,uuid-ossp), or '*' for every installed "
             "extension the server knows, whose IMMUTABLE/STABLE, non-SECURITY-DEFINER functions and aggregates the "
-            "query validator accepts. The transaction stays read-only."
+            "query validator accepts. Naming 'age' (or '*' with AGE installed) also admits read-only cypher() "
+            "calls, checked by a Cypher guard. The transaction stays read-only."
         ),
     )
     out_defaults = OutputLimits()
@@ -775,12 +879,29 @@ async def main():
                 destructiveHint=True,
             ),
         )
+        mcp.add_tool(
+            execute_cypher,
+            description=CYPHER_DESCRIPTION + " Any Cypher runs, including CREATE, MERGE, SET and DELETE.",
+            annotations=ToolAnnotations(
+                title="Execute Cypher",
+                destructiveHint=True,
+            ),
+        )
     else:
         mcp.add_tool(
             execute_sql,
             description="Execute a read-only SQL query",
             annotations=ToolAnnotations(
                 title="Execute SQL (Read-Only)",
+                readOnlyHint=True,
+            ),
+        )
+        mcp.add_tool(
+            execute_cypher,
+            description=CYPHER_DESCRIPTION
+            + " Read-only: write clauses and SQL functions are refused, and AGE must be admitted with --allow-extension-functions.",
+            annotations=ToolAnnotations(
+                title="Execute Cypher (Read-Only)",
                 readOnlyHint=True,
             ),
         )

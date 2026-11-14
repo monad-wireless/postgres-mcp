@@ -26,6 +26,14 @@ overload anywhere is unsafe, the name stays out. Extensions whose functions exec
 (pgRouting's ``pgr_*`` take an inner query) must not be named; their VOLATILE marking excludes them
 anyway, and the inner query would bypass the parser.
 
+``EXCLUDED_FUNCTIONS`` removes names that pass the catalogue test but must not run. Apache AGE
+marks ``age_prepare_cypher`` STABLE, yet it stores a graph name and query that a later
+``cypher(NULL, NULL)`` runs, out of sight of the Cypher guard. ``age_delete_global_graphs`` is
+STABLE too, but it drops the session's graph cache.
+
+Naming ``age`` also admits ``cypher()`` itself, which AGE declares VOLATILE: the SQL validator
+then checks its arguments and runs ``CypherGuard`` on the query text (see ``cypher_guard``).
+
 The transaction stays read-only regardless (``SafeSqlDriver.execute_query`` forces it); this only
 widens which read functions the parser accepts.
 """
@@ -34,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 
 from typing_extensions import LiteralString
 
@@ -44,6 +53,22 @@ logger = logging.getLogger(__name__)
 
 _EXTENSION_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALL_INSTALLED = "*"
+AGE_EXTENSION = "age"
+EXCLUDED_FUNCTIONS: frozenset[str] = frozenset({"age_prepare_cypher", "age_delete_global_graphs"})
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionAllowlist:
+    """The admitted function names and the installed extensions they came from."""
+
+    functions: frozenset[str] = frozenset()
+    extensions: tuple[str, ...] = ()
+
+    @property
+    def cypher(self) -> bool:
+        """True when Apache AGE is among the admitted extensions, so ``cypher()`` may run."""
+        return AGE_EXTENSION in self.extensions
+
 
 DISCOVERY_QUERY: LiteralString = """
 WITH ext_funcs AS (
@@ -101,12 +126,17 @@ async def resolve_extensions(sql_driver: SqlDriver, extensions: tuple[str, ...])
     return tuple(str(row.cells["extname"]) for row in rows or [])
 
 
-async def discover_read_only_functions(sql_driver: SqlDriver, extensions: tuple[str, ...]) -> frozenset[str]:
-    """Names of the safe functions owned by ``extensions``; empty when none are named or installed."""
+async def discover_allowlist(sql_driver: SqlDriver, extensions: tuple[str, ...]) -> ExtensionAllowlist:
+    """The safe functions owned by ``extensions``, minus ``EXCLUDED_FUNCTIONS``; empty when none are named or installed."""
     resolved = await resolve_extensions(sql_driver, extensions)
     if not resolved:
-        return frozenset()
+        return ExtensionAllowlist()
     rows = await sql_driver.execute_query(DISCOVERY_QUERY, params=[list(resolved)], force_readonly=True)
-    names = frozenset(str(row.cells["name"]) for row in rows or [])
+    names = frozenset(str(row.cells["name"]) for row in rows or []) - EXCLUDED_FUNCTIONS
     logger.info(f"Allowing {len(names)} read-only functions from extensions: {', '.join(resolved)}")
-    return names
+    return ExtensionAllowlist(functions=names, extensions=tuple(resolved))
+
+
+async def discover_read_only_functions(sql_driver: SqlDriver, extensions: tuple[str, ...]) -> frozenset[str]:
+    """Names of the safe functions owned by ``extensions`` (``discover_allowlist`` without the extension list)."""
+    return (await discover_allowlist(sql_driver, extensions)).functions

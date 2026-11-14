@@ -34,7 +34,7 @@ from .sql import DbConnPool
 from .sql import PoolBudget
 from .sql import PoolSettings
 from .sql import SqlDriver
-from .sql import discover_read_only_functions
+from .sql import discover_allowlist
 from .sql import obfuscate_password
 
 logger = logging.getLogger(__name__)
@@ -92,12 +92,14 @@ class Database:
 
     ``extension_functions`` is ``None`` until discovery succeeds. It lives here and not on the pool,
     so a pool that the budget evicts and later reopens does not rerun the catalogue query.
+    ``cypher`` is true when discovery admitted Apache AGE, so restricted mode accepts ``cypher()``.
     """
 
     name: str
     url: str
     pool: DbConnPool
     extension_functions: frozenset[str] | None = None
+    cypher: bool = False
     _discovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False, compare=False)
 
     async def ensure_discovered(self, allowed_extensions: tuple[str, ...]) -> None:
@@ -114,8 +116,10 @@ class Database:
             if self.extension_functions is not None:
                 return
             try:
-                self.extension_functions = await discover_read_only_functions(SqlDriver(conn=self.pool), allowed_extensions)
-                logger.info(f"Database {self.name!r}: {len(self.extension_functions)} extension functions admitted")
+                allowlist = await discover_allowlist(SqlDriver(conn=self.pool), allowed_extensions)
+                self.cypher = allowlist.cypher
+                self.extension_functions = allowlist.functions
+                logger.info(f"Database {self.name!r}: {len(allowlist.functions)} extension functions admitted, cypher {self.cypher}")
             except Exception as e:
                 logger.warning(f"Extension discovery on {self.name!r} failed, will retry: {obfuscate_password(str(e))}")
 
@@ -130,6 +134,7 @@ class Database:
             "dbname": parsed.path.lstrip("/") or None,
             **self.pool.describe(),
             "extension_functions": None if self.extension_functions is None else len(self.extension_functions),
+            "cypher": self.cypher,
         }
 
 

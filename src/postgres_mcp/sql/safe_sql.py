@@ -84,12 +84,17 @@ from psycopg.sql import Composable
 from psycopg.sql import Literal
 from typing_extensions import LiteralString
 
+from .cypher_guard import CypherGuard
 from .json_output import QueryTable
 from .sql_driver import SqlDriver
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _is_string_constant(node: Any) -> bool:
+    return isinstance(node, A_Const) and not node.isnull and isinstance(node.val, String)
 
 
 class SafeSqlDriver(SqlDriver):
@@ -101,8 +106,6 @@ class SafeSqlDriver(SqlDriver):
     Performs deep validation of the query tree to prevent unsafe operations.
     """
 
-    # Pattern to match pg_catalog schema qualification
-    PG_CATALOG_PATTERN = re.compile(r"^pg_catalog\.(.+)$")
     # Pattern to validate LIKE expressions - must either start with % or end with %, but not both
     LIKE_PATTERN = re.compile(r"^[^%]+%$")
 
@@ -878,18 +881,73 @@ class SafeSqlDriver(SqlDriver):
         "postgis_topology",
     }
 
-    def __init__(self, sql_driver: SqlDriver, timeout: float | None = None, extra_functions: frozenset[str] = frozenset()):
+    def __init__(
+        self,
+        sql_driver: SqlDriver,
+        timeout: float | None = None,
+        extra_functions: frozenset[str] = frozenset(),
+        cypher_guard: CypherGuard | None = None,
+    ):
         """Initialize with an underlying SQL driver and optional timeout.
 
         Args:
             sql_driver: The underlying SQL driver to wrap
             timeout: Optional timeout in seconds for query execution
             extra_functions: Additional lower-case function names to accept, discovered from installed
-                extensions by ``extension_functions.discover_read_only_functions`` (opt-in)
+                extensions by ``extension_functions.discover_allowlist`` (opt-in)
+            cypher_guard: When set (Apache AGE admitted), ``cypher()`` is accepted with constant graph and
+                query arguments, and the guard checks the Cypher text; when ``None``, ``cypher()`` is refused
         """
         self.sql_driver = sql_driver
         self.timeout = timeout
         self.extra_functions = extra_functions
+        self.cypher_guard = cypher_guard
+
+    def _validate_function(self, node: FuncCall) -> None:
+        """Admit a core function (bare or ``pg_catalog.``), an admitted extension function in any schema, or ``cypher()``.
+
+        An extension function passes with any schema qualifier because discovery admits a name only
+        when every function of that name, in every schema, is safe.
+        """
+        parts = [str(n.sval).lower() for n in node.funcname] if node.funcname else []
+        func_name = ".".join(parts)
+        if not parts or len(parts) > 2:
+            raise ValueError(f"Function {func_name} is not allowed")
+        name, schema = parts[-1], (parts[0] if len(parts) == 2 else None)
+        if name == "cypher" and schema in (None, "ag_catalog"):
+            self._validate_cypher_call(node)
+            return
+        if schema in (None, "pg_catalog") and name in self.ALLOWED_FUNCTIONS:
+            return
+        if name in self.extra_functions:
+            return
+        raise ValueError(
+            f"Function {func_name} is not allowed. If an installed extension owns it, start the server with "
+            "--allow-extension-functions=<extension> (or '*') to admit that extension's read-only functions. "
+            "Operators are not checked against this list, so an operator of the same extension can still run."
+        )
+
+    def _validate_cypher_call(self, node: FuncCall) -> None:
+        """``cypher('graph', $$query$$ [, $1])``: constants only, and a Cypher text the guard accepts.
+
+        A NULL graph or query would run a query stored earlier by ``age_prepare_cypher``, which the
+        guard never saw, so both must be string constants. The optional third argument must be a bind
+        parameter (AGE refuses anything else).
+        """
+        if self.cypher_guard is None:
+            raise ValueError("cypher() needs --allow-extension-functions age (or '*') in restricted mode")
+        if node.agg_star or node.agg_distinct or node.func_variadic or node.agg_filter or node.over or node.agg_order:
+            raise ValueError("cypher() takes plain positional arguments only")
+        args: tuple[Any, ...] = tuple(node.args) if node.args else ()
+        if len(args) not in (2, 3):
+            raise ValueError("cypher() takes a graph name, a query and an optional parameter")
+        graph, query = args[0], args[1]
+        if not (_is_string_constant(graph) and _is_string_constant(query)):
+            raise ValueError("cypher() needs the graph name and the query as string constants")
+        if len(args) == 3 and not isinstance(args[2], ParamRef):
+            raise ValueError("the third argument of cypher() must be a bind parameter")
+        assert isinstance(query, A_Const) and isinstance(query.val, String)
+        self.cypher_guard.check(str(query.val.sval))
 
     def _validate_node(self, node: Node) -> None:
         """Recursively validate a node and all its children"""
@@ -911,16 +969,7 @@ class SafeSqlDriver(SqlDriver):
 
         # Validate function calls
         if isinstance(node, FuncCall):
-            func_name = ".".join([str(n.sval) for n in node.funcname]).lower() if node.funcname else ""
-            # Strip pg_catalog schema if present
-            match = self.PG_CATALOG_PATTERN.match(func_name)
-            unqualified_name = match.group(1) if match else func_name
-            if unqualified_name not in self.ALLOWED_FUNCTIONS and unqualified_name not in self.extra_functions:
-                raise ValueError(
-                    f"Function {func_name} is not allowed. If an installed extension owns it, start the server with "
-                    "--allow-extension-functions=<extension> (or '*') to admit that extension's read-only functions. "
-                    "Operators are not checked against this list, so an operator of the same extension can still run."
-                )
+            self._validate_function(node)
 
         # Reject SELECT statements with locking clauses
         if isinstance(node, SelectStmt) and getattr(node, "lockingClause", None):
@@ -1017,8 +1066,27 @@ class SafeSqlDriver(SqlDriver):
         """``SqlDriver.execute_table`` after the same validation, timeout and forced read-only transaction."""
         return await self._guarded(query, lambda q: self.sql_driver.execute_table(q, params=params, force_readonly=True, max_rows=max_rows))
 
-    async def _guarded(self, query: LiteralString, run: Callable[[LiteralString], Awaitable[T]]) -> T:
-        self._validate(query)
+    async def execute_bound_table(
+        self,
+        query: LiteralString,
+        params: list[Any],
+        validate_as: str,
+        max_rows: int | None = None,
+    ) -> QueryTable | None:
+        """Run ``query`` (psycopg ``%s`` placeholders, ``%`` doubled) after validating ``validate_as``.
+
+        pglast cannot parse ``%s``, so the caller passes the same statement with ``$1``-style
+        placeholders and single ``%`` as ``validate_as``. Both must be built from the same parts.
+        The transaction is read-only and the timeout applies, as in ``execute_table``.
+        """
+        return await self._guarded(
+            query,
+            lambda q: self.sql_driver.execute_table(q, params=params, force_readonly=True, max_rows=max_rows),
+            validate_as=validate_as,
+        )
+
+    async def _guarded(self, query: LiteralString, run: Callable[[LiteralString], Awaitable[T]], validate_as: str | None = None) -> T:
+        self._validate(query if validate_as is None else validate_as)
         tagged: LiteralString = f"/* crystaldba */ {query}"
         if not self.timeout:
             return await run(tagged)

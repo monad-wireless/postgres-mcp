@@ -15,6 +15,7 @@ from postgres_mcp.databases import UnknownDatabaseError
 from postgres_mcp.databases import collect_database_urls
 from postgres_mcp.databases import parse_database_spec
 from postgres_mcp.server import AccessMode
+from postgres_mcp.sql import ExtensionAllowlist
 from postgres_mcp.sql import SafeSqlDriver
 from postgres_mcp.sql import SqlDriver
 from postgres_mcp.sql.sql_driver import DbConnPool
@@ -98,6 +99,7 @@ def test_describe_has_location_and_no_credentials():
         "last_error": None,
         "superuser": None,
         "extension_functions": None,
+        "cypher": False,
     }
     assert described[1]["default"] is False
     assert "secret" not in repr(described)
@@ -112,10 +114,10 @@ async def test_open_default_opens_only_the_default_and_discovers_it():
         opened.append(self.connection_url)
         return MagicMock()
 
-    discover = AsyncMock(return_value=frozenset({"st_area"}))
+    discover = AsyncMock(return_value=ExtensionAllowlist(frozenset({"st_area"}), ("postgis",)))
     with (
         patch.object(DbConnPool, "pool_connect", pool_connect),
-        patch("postgres_mcp.databases.discover_read_only_functions", discover),
+        patch("postgres_mcp.databases.discover_allowlist", discover),
     ):
         await registry.open_default()
 
@@ -131,7 +133,7 @@ async def test_open_default_logs_a_failure_without_raising():
     failing = AsyncMock(side_effect=ValueError("Connection attempt failed"))
     with (
         patch.object(DbConnPool, "pool_connect", failing),
-        patch("postgres_mcp.databases.discover_read_only_functions", discover),
+        patch("postgres_mcp.databases.discover_allowlist", discover),
     ):
         await registry.open_default()
     discover.assert_not_awaited()
@@ -142,7 +144,7 @@ async def test_open_default_logs_a_failure_without_raising():
 async def test_ready_skips_discovery_without_extensions():
     registry = DatabaseRegistry([("gis", GIS)])
     discover = AsyncMock()
-    with patch("postgres_mcp.databases.discover_read_only_functions", discover):
+    with patch("postgres_mcp.databases.discover_allowlist", discover):
         db = await registry.ready("gis")
     discover.assert_not_awaited()
     assert db.extension_functions == frozenset()
@@ -152,8 +154,8 @@ async def test_ready_skips_discovery_without_extensions():
 @pytest.mark.asyncio
 async def test_ready_retries_discovery_after_a_failure_and_then_caches_it():
     registry = DatabaseRegistry([("gis", GIS)], allowed_extensions=("postgis",))
-    discover = AsyncMock(side_effect=[ValueError("Connection attempt failed"), frozenset({"st_area"})])
-    with patch("postgres_mcp.databases.discover_read_only_functions", discover):
+    discover = AsyncMock(side_effect=[ValueError("Connection attempt failed"), ExtensionAllowlist(frozenset({"st_area"}), ("postgis",))])
+    with patch("postgres_mcp.databases.discover_allowlist", discover):
         assert (await registry.ready()).extension_functions is None
         assert (await registry.ready()).extension_functions == frozenset({"st_area"})
         await registry.ready()

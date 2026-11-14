@@ -16,6 +16,7 @@ import pytest
 
 from postgres_mcp.databases import DatabaseRegistry
 from postgres_mcp.sql import DbConnPool
+from postgres_mcp.sql import ExtensionAllowlist
 from postgres_mcp.sql import PoolBudget
 from postgres_mcp.sql import PoolSettings
 
@@ -203,8 +204,8 @@ async def test_discovery_survives_eviction_and_reopen():
         budget=budget,
         allowed_extensions=("postgis",),
     )
-    discover = AsyncMock(return_value=frozenset({"st_area"}))
-    with patch("postgres_mcp.databases.discover_read_only_functions", discover):
+    discover = AsyncMock(return_value=ExtensionAllowlist(frozenset({"st_area"}), ("postgis",)))
+    with patch("postgres_mcp.databases.discover_allowlist", discover):
         gis = await registry.ready("gis")
         await _use(gis.pool)
         await _use(registry.get("lake").pool)  # evicts gis
