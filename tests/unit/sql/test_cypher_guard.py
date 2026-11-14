@@ -142,14 +142,14 @@ async def test_cypher_refused_without_age_opt_in():
 
 @pytest.mark.asyncio
 async def test_qualified_core_function_outside_pg_catalog_stays_refused():
-    with pytest.raises(ValueError, match="public.count"):
+    with pytest.raises(ValueError, match=r"public\.count"):
         await _safe().execute_query("SELECT public.count(*) FROM t")
 
 
 def test_build_statement_without_params():
     s = build_cypher_statement("probe_g", "MATCH (n) WHERE n.x % 2 = 0 RETURN n", ["n"])
     assert s.sql == s.validate_as
-    assert s.sql == 'SELECT * FROM ag_catalog.cypher(\'probe_g\', $cypher$MATCH (n) WHERE n.x % 2 = 0 RETURN n$cypher$) AS ("n" ag_catalog.agtype)'
+    assert s.sql == "SELECT * FROM ag_catalog.cypher('probe_g', $cypher$MATCH (n) WHERE n.x % 2 = 0 RETURN n$cypher$) AS (\"n\" ag_catalog.agtype)"
     assert s.params == []
 
 

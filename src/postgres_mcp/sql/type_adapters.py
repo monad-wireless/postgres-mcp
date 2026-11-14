@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 EXTENSION_TYPES: tuple[str, ...] = ("hstore", "vector", "halfvec", "sparsevec", "agtype")
 
-AGE_LOAD_STATEMENTS: tuple[LiteralString, ...] = ()
+AGE_LOAD_STATEMENTS: tuple[LiteralString, ...] = ("LOAD 'age'", "LOAD '$libdir/plugins/age'")
 AGE_SEARCH_PATH: LiteralString = """
 SELECT pg_catalog.set_config(
     'search_path',
@@ -154,7 +154,7 @@ class _SparseVectorLoader(Loader):
         return SparseVector.parse(bytes(data).decode())
 
 
-class _AgtypeLoader(Loader):
+class AgtypeLoader(Loader):
     def load(self, data: Any) -> Any:
         text = bytes(data).decode()
         try:
@@ -199,7 +199,7 @@ class ExtensionTypeCache:
 def register_extension_loaders(conn: AsyncConnection[Any], types: dict[str, TypeInfo]) -> None:
     if (info := types.get("hstore")) is not None:
         register_hstore(info, conn)
-    for name, loader in (("vector", _VectorLoader), ("halfvec", _VectorLoader), ("sparsevec", _SparseVectorLoader), ("agtype", _AgtypeLoader)):
+    for name, loader in (("vector", _VectorLoader), ("halfvec", _VectorLoader), ("sparsevec", _SparseVectorLoader), ("agtype", AgtypeLoader)):
         if (info := types.get(name)) is not None:
             info.register(conn)  # so column type names resolve ("vector", not the OID)
             conn.adapters.register_loader(info.oid, loader)

@@ -148,7 +148,8 @@ class TestRestrictedReader:
     @pytest.mark.asyncio
     async def test_execute_sql_cypher_comparison_needs_the_search_path_setup(self, url):
         with _server(url, AccessMode.RESTRICTED, ("age",)):
-            out = _json(await server.execute_sql(sql="SELECT * FROM cypher('people', $$ MATCH (n:Person) WHERE n.age = 30 RETURN n.name $$) AS (v agtype)", database=None))
+            sql = "SELECT * FROM cypher('people', $$ MATCH (n:Person) WHERE n.age = 30 RETURN n.name $$) AS (v agtype)"
+            out = _json(await server.execute_sql(sql=sql, database=None))
         assert out["rows"] == [["Ann"]]
 
     @pytest.mark.asyncio

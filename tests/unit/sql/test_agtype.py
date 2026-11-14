@@ -16,7 +16,9 @@ from postgres_mcp.sql.json_output import QueryTable
 from postgres_mcp.sql.json_output import ResultColumn
 from postgres_mcp.sql.json_output import dumps
 from postgres_mcp.sql.json_output import render_table
-from postgres_mcp.sql.type_adapters import _AgtypeLoader
+from postgres_mcp.sql.type_adapters import AGE_LOAD_STATEMENTS
+from postgres_mcp.sql.type_adapters import AgtypeLoader
+from postgres_mcp.sql.type_adapters import ExtensionTypeCache
 
 VERTEX = (
     '{"id": 844424930131969, "label": "Person", "properties": {"age": 30, "big": 12345678901234600000::numeric, '
@@ -89,8 +91,18 @@ def test_unknown_suffix_keeps_the_value():
     assert parse_agtype('"x"::future_type') == "x"
 
 
+def test_age_session_setup_tries_both_load_forms():
+    """Without these, the first cypher() of a session fails on a server that does not preload AGE.
+
+    The Docker test test_first_cypher_call_works_without_preload covers the behaviour; this one
+    runs where Docker does not (an emptied tuple shipped once in c863148).
+    """
+    assert AGE_LOAD_STATEMENTS == ("LOAD 'age'", "LOAD '$libdir/plugins/age'")
+    assert ExtensionTypeCache().age_loads == AGE_LOAD_STATEMENTS
+
+
 def test_loader_keeps_unparseable_text():
-    loader = _AgtypeLoader(0)
+    loader = AgtypeLoader(0)
     assert loader.load(b"not agtype @") == "not agtype @"
     assert isinstance(loader.load(VERTEX.encode()), GraphVertex)
 
